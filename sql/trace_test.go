@@ -25,7 +25,7 @@ import (
 	"testing"
 	"text/tabwriter"
 
-	"github.com/cockroachdb/cockroach/config"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
@@ -83,10 +83,9 @@ func prettyPrint(m [][]string) string {
 
 func TestExplainTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer config.TestingDisableTableSplits()()
-
-	s, sqlDB, _ := setup(t)
-	defer cleanup(s, sqlDB)
+	params, _ := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
 
 	if _, err := sqlDB.Exec(`CREATE DATABASE test; CREATE TABLE test.foo (id INT PRIMARY KEY)`); err != nil {
 		t.Fatal(err)

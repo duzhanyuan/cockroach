@@ -20,13 +20,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/storagebase"
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
-	"github.com/pkg/errors"
 )
 
 // TestReplicaGCQueueDropReplica verifies that a removed replica is
@@ -61,7 +62,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if i, _ := r.Desc().FindReplica(2); i >= 0 {
+				if _, ok := r.Desc().GetReplicaDescriptor(2); ok {
 					return errors.New("expected second node gone from first node's known replicas")
 				}
 				return nil
@@ -92,7 +93,7 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	mtc := startMultiTestContext(t, 3)
 	defer mtc.Stop()
 	// Disable the replica gc queue to prevent direct removal of replica.
-	mtc.stores[1].DisableReplicaGCQueue(true)
+	mtc.stores[1].SetReplicaGCQueueActive(false)
 
 	rangeID := roachpb.RangeID(1)
 	mtc.replicateRange(rangeID, 1, 2)
@@ -106,10 +107,10 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	}
 
 	// Enable the queue.
-	mtc.stores[1].DisableReplicaGCQueue(false)
+	mtc.stores[1].SetReplicaGCQueueActive(true)
 
 	// Increment the clock's timestamp to make the replica GC queue process the range.
-	mtc.expireLeaderLeases()
+	mtc.expireLeases()
 	mtc.manualClock.Increment(int64(storage.ReplicaGCQueueInactivityThreshold + 1))
 
 	// Make sure the range is removed from the store.

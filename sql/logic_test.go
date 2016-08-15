@@ -29,7 +29,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,11 +37,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/cockroach/config"
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
@@ -191,7 +191,7 @@ var (
 	// Output parameters
 	showSQL = flag.Bool("show-sql", false,
 		"print the individual SQL statement/queries before processing")
-	errorSummary = flag.Bool("error-summary", false,
+	printErrorSummary = flag.Bool("error-summary", false,
 		"print a per-error summary of failing queries at the end of testing, when -allow-prepare-fail is set")
 	fullMessages = flag.Bool("full-messages", false,
 		"do not shorten the error or SQL strings when printing the summary for -allow-prepare-fail or -flex-types.")
@@ -330,7 +330,7 @@ type logicQuery struct {
 type logicTest struct {
 	*testing.T
 	// the database server instantiated for this input file.
-	srv *testServer
+	srv serverutils.TestServerInterface
 	// map of built clients. Needs to be persisted so that we can
 	// re-use them and close them all on exit.
 	clients map[string]*gosql.DB
@@ -372,7 +372,7 @@ func (t *logicTest) close() {
 		t.cleanupRootUser = nil
 	}
 	if t.srv != nil {
-		cleanupTestServer(t.srv)
+		t.srv.Stopper().Stop()
 		t.srv = nil
 	}
 	if t.clients != nil {
@@ -422,7 +422,7 @@ func (t *logicTest) setUser(user string) func() {
 		return func() {}
 	}
 
-	pgURL, cleanupFunc := sqlutils.PGUrl(t.T, t.srv.TestServer.ServingAddr(), user, "TestLogic")
+	pgURL, cleanupFunc := sqlutils.PGUrl(t.T, t.srv.ServingAddr(), user, "TestLogic")
 	db, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
@@ -449,13 +449,20 @@ func (t *logicTest) run(path string) {
 func (t *logicTest) setup() {
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
-	ctx := server.MakeTestContext()
-	ctx.MaxOffset = logicMaxOffset
-	ctx.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{
-		WaitForGossipUpdate:   true,
-		CheckStmtStringChange: true,
+	// TODO(andrei): if createTestServerParams() is used here, the command filter
+	// it installs detects a transaction that doesn't have
+	// modifiedSystemConfigSpan set even though it should, for
+	// "testdata/rename_table". Figure out what's up with that.
+	params := base.TestServerArgs{
+		MaxOffset: logicMaxOffset,
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				WaitForGossipUpdate:   true,
+				CheckStmtStringChange: true,
+			},
+		},
 	}
-	t.srv = setupTestServerWithContext(t.T, &ctx)
+	t.srv, _, _ = serverutils.StartServer(t.T, params)
 
 	// db may change over the lifetime of this function, with intermediate
 	// values cached in t.clients and finally closed in t.close().
@@ -489,14 +496,11 @@ func (t *logicTest) processTestFile(path string) error {
 	if t.verbose {
 		fmt.Println("--- queries start here")
 		defer t.printCompletion(path)
-		if *errorSummary {
-			defer t.printErrorSummary()
-		}
 	}
 
 	t.lastProgress = timeutil.Now()
 
-	execKnobs := t.srv.Ctx.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs)
+	execKnobs := t.srv.(*server.TestServer).Ctx.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs)
 
 	repeat := 1
 	s := newLineScanner(file)
@@ -691,7 +695,6 @@ func (t *logicTest) processTestFile(path string) error {
 			t.success(path)
 
 		case "halt", "hash-threshold":
-			break
 
 		case "user":
 			if len(fields) < 2 {
@@ -763,11 +766,7 @@ func (t *logicTest) processTestFile(path string) error {
 		}
 	}
 
-	if err := s.Err(); err != nil {
-		return err
-	}
-
-	return nil
+	return s.Err()
 }
 
 // verifyError checks that either no error was found where none was
@@ -924,18 +923,16 @@ func (t *logicTest) execQuery(query logicQuery) error {
 						if *flexTypes && (valT == reflect.Float64 || valT == reflect.Slice) {
 							t.signalIgnoredError(fmt.Errorf("result type mismatch: expected I, got %T", val), query.pos, query.sql)
 							return nil
-						} else {
-							return fmt.Errorf("%s: expected int value for column %d, but found %T: %#v", query.pos, i, val, val)
 						}
+						return fmt.Errorf("%s: expected int value for column %d, but found %T: %#v", query.pos, i, val, val)
 					}
 				case 'R':
 					if valT != reflect.Float64 && valT != reflect.Slice {
 						if *flexTypes && (valT == reflect.Int64) {
 							t.signalIgnoredError(fmt.Errorf("result type mismatch: expected R, got %T", val), query.pos, query.sql)
 							return nil
-						} else {
-							return fmt.Errorf("%s: expected float/decimal value for column %d, but found %T: %#v", query.pos, i, val, val)
 						}
+						return fmt.Errorf("%s: expected float/decimal value for column %d, but found %T: %#v", query.pos, i, val, val)
 					}
 				case 'B':
 					if valT != reflect.Bool {
@@ -1022,34 +1019,8 @@ func (t *logicTest) success(file string) {
 	}
 }
 
-func (t *logicTest) traceStart(filename string) {
-	if t.traceFile != nil {
-		t.Fatalf("tracing already active")
-	}
-	var err error
-	t.traceFile, err = os.Create(filename)
-	if err != nil {
-		t.Fatalf("unable to open trace output file: %s", err)
-	}
-	if err := trace.Start(t.traceFile); err != nil {
-		t.Fatalf("unable to start tracing: %s", err)
-	}
-}
-
-func (t *logicTest) traceStop() {
-	if t.traceFile != nil {
-		trace.Stop()
-		t.traceFile.Close()
-		t.traceFile = nil
-	}
-}
-
 func TestLogic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
-	// TODO(marc): splitting ranges at table boundaries causes
-	// a blocked task and won't drain. Investigate and fix.
-	defer config.TestingDisableTableSplits()()
 
 	var globs []string
 	if *bigtest {
@@ -1114,6 +1085,9 @@ func TestLogic(t *testing.T) {
 		verbose:         verbose,
 		perErrorSummary: make(map[string][]string),
 	}
+	if *printErrorSummary {
+		defer l.printErrorSummary()
+	}
 	for _, p := range paths {
 		if verbose {
 			fmt.Printf("--- input: %s\n", p)
@@ -1138,30 +1112,46 @@ func TestLogic(t *testing.T) {
 	fmt.Printf("--- total: %d tests, %d failures%s\n", total, totalFail, unsupportedMsg)
 }
 
+type errorSummaryEntry struct {
+	errmsg string
+	sql    []string
+}
+type errorSummary []errorSummaryEntry
+
+func (e errorSummary) Len() int { return len(e) }
+func (e errorSummary) Less(i, j int) bool {
+	if len(e[i].sql) == len(e[j].sql) {
+		return e[i].errmsg < e[j].errmsg
+	}
+	return len(e[i].sql) < len(e[j].sql)
+}
+func (e errorSummary) Swap(i, j int) {
+	t := e[i]
+	e[i] = e[j]
+	e[j] = t
+}
+
 // printErrorSummary shows the final per-error list of failing queries when
 // -allow-prepare-fail or -flex-types are specified.
 func (t *logicTest) printErrorSummary() {
-	if t.unsupported > 0 {
-		fmt.Println("--- summary of ignored errors:")
-		for errmsg, sql := range t.perErrorSummary {
-			fmt.Println(errmsg)
-			for _, q := range sql {
-				fmt.Println("\t", strings.Replace(q, "\n", "\n\t", -1))
-			}
-			fmt.Println()
-		}
+	if t.unsupported == 0 {
+		return
 	}
-}
 
-// splitLastMessagePart separates, for messages containing multiple
-// parts separated by ":", all parts but the last and the last part
-// into separate strings.
-func splitLastMessagePart(msg string) (string, string) {
-	expIdx := strings.LastIndex(msg, ": ")
-	if expIdx != -1 {
-		return msg[:expIdx] + ": ...", msg[expIdx+2:]
+	fmt.Println("--- summary of ignored errors:")
+	summary := make(errorSummary, len(t.perErrorSummary))
+	i := 0
+	for errmsg, sql := range t.perErrorSummary {
+		summary[i] = errorSummaryEntry{errmsg: errmsg, sql: sql}
 	}
-	return msg, ""
+	sort.Sort(summary)
+	for _, t := range summary {
+		fmt.Printf("%s (%d entries)\n", t.errmsg, len(t.sql))
+		for _, q := range t.sql {
+			fmt.Println("\t", strings.Replace(q, "\n", "\n\t", -1))
+		}
+		fmt.Println()
+	}
 }
 
 // shortenString cuts its argument on the right so that it more likely
@@ -1192,16 +1182,46 @@ func shortenString(msg string) string {
 	return msg
 }
 
+// simplifyError condenses long error strings to the shortest form
+// that still explains the origin of the error.
+func simplifyError(msg string) (string, string) {
+	prefix := strings.Split(msg, ": ")
+
+	// Split:  "a: b: c"-> "a: b", "c"
+	expected := ""
+	if len(prefix) > 1 {
+		expected = prefix[len(prefix)-1]
+		prefix = prefix[:len(prefix)-1]
+	}
+
+	// Simplify: "a: b: c: d" -> "a: d"
+	if !*fullMessages && len(prefix) > 2 {
+		prefix[1] = prefix[len(prefix)-1]
+		prefix = prefix[:2]
+	}
+
+	// Mark the error message as shortened if necessary.
+	if expected != "" {
+		prefix = append(prefix, "...")
+	}
+
+	return strings.Join(prefix, ": "), expected
+}
+
 // signalIgnoredError registers a failing but ignored query.
 func (t *logicTest) signalIgnoredError(err error, pos string, sql string) {
-	if *errorSummary {
-		errmsg, expected := splitLastMessagePart(fmt.Sprintf("%s", err))
-		var buf bytes.Buffer
-		fmt.Fprintf(&buf, "-- %s (%s)\n%s", pos, shortenString(expected), shortenString(sql+";"))
-		errmsg = shortenString(errmsg)
-		t.perErrorSummary[errmsg] = append(t.perErrorSummary[errmsg], buf.String())
-	}
 	t.unsupported++
+
+	if !*printErrorSummary {
+		return
+	}
+
+	// Save the error for later reporting.
+	errmsg, expected := simplifyError(fmt.Sprintf("%s", err))
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "-- %s (%s)\n%s", pos, shortenString(expected), shortenString(sql+";"))
+	errmsg = shortenString(errmsg)
+	t.perErrorSummary[errmsg] = append(t.perErrorSummary[errmsg], buf.String())
 }
 
 // Errorf overloads testing.T.Errorf to handle printing the

@@ -58,6 +58,8 @@ var (
 	testKey2     = roachpb.Key("/db2")
 	testKey3     = roachpb.Key("/db3")
 	testKey4     = roachpb.Key("/db4")
+	testKey5     = roachpb.Key("/db5")
+	testKey6     = roachpb.Key("/db6")
 	txn1         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, Timestamp: makeTS(0, 1)}}
 	txn1Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, Timestamp: makeTS(0, 1)}, Status: roachpb.COMMITTED}
 	txn1Abort    = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1}, Status: roachpb.ABORTED}
@@ -70,6 +72,7 @@ var (
 	value3       = roachpb.MakeValueFromString("testValue3")
 	value4       = roachpb.MakeValueFromString("testValue4")
 	value5       = roachpb.MakeValueFromString("testValue5")
+	value6       = roachpb.MakeValueFromString("testValue6")
 	tsvalue1     = timeSeriesAsValue(testtime, 1000, []tsSample{
 		{1, 1, 5, 5, 5},
 	}...)
@@ -110,19 +113,20 @@ func (n mvccKeys) Less(i, j int) bool { return n[i].Less(n[j]) }
 func TestMVCCStatsAddSubAgeTo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	goldMS := enginepb.MVCCStats{
-		KeyBytes:        1,
-		KeyCount:        1,
-		ValBytes:        1,
-		ValCount:        1,
-		IntentBytes:     1,
-		IntentCount:     1,
-		IntentAge:       1,
-		GCBytesAge:      1,
-		LiveBytes:       1,
-		LiveCount:       1,
-		SysBytes:        1,
-		SysCount:        1,
-		LastUpdateNanos: 1,
+		ContainsEstimates: true,
+		KeyBytes:          1,
+		KeyCount:          1,
+		ValBytes:          1,
+		ValCount:          1,
+		IntentBytes:       1,
+		IntentCount:       1,
+		IntentAge:         1,
+		GCBytesAge:        1,
+		LiveBytes:         1,
+		LiveCount:         1,
+		SysBytes:          1,
+		SysCount:          1,
+		LastUpdateNanos:   1,
 	}
 	if err := util.NoZeroField(&goldMS); err != nil {
 		t.Fatal(err) // prevent rot as fields are added
@@ -136,7 +140,10 @@ func TestMVCCStatsAddSubAgeTo(t *testing.T) {
 	}
 
 	ms := goldMS
-	zeroWithLU := enginepb.MVCCStats{LastUpdateNanos: ms.LastUpdateNanos}
+	zeroWithLU := enginepb.MVCCStats{
+		ContainsEstimates: true,
+		LastUpdateNanos:   ms.LastUpdateNanos,
+	}
 
 	ms.Subtract(goldMS)
 	cmp(ms, zeroWithLU)
@@ -268,10 +275,10 @@ func TestMVCCEmptyKey(t *testing.T) {
 	if err := MVCCPut(context.Background(), engine, nil, roachpb.Key{}, makeTS(0, 1), value1, nil); err == nil {
 		t.Error("expected empty key error")
 	}
-	if _, _, err := MVCCScan(context.Background(), engine, roachpb.Key{}, testKey1, 0, makeTS(0, 1), true, nil); err != nil {
+	if _, _, err := MVCCScan(context.Background(), engine, roachpb.Key{}, testKey1, math.MaxInt64, makeTS(0, 1), true, nil); err != nil {
 		t.Errorf("empty key allowed for start key in scan; got %s", err)
 	}
-	if _, _, err := MVCCScan(context.Background(), engine, testKey1, roachpb.Key{}, 0, makeTS(0, 1), true, nil); err == nil {
+	if _, _, err := MVCCScan(context.Background(), engine, testKey1, roachpb.Key{}, math.MaxInt64, makeTS(0, 1), true, nil); err == nil {
 		t.Error("expected empty key error")
 	}
 	if err := MVCCResolveWriteIntent(context.Background(), engine, nil, roachpb.Intent{}); err == nil {
@@ -953,7 +960,7 @@ func TestMVCCScanWriteIntentError(t *testing.T) {
 		if scan.consistent {
 			cStr = "consistent"
 		}
-		kvs, intents, err := MVCCScan(context.Background(), engine, testKey1, testKey4.Next(), 0, makeTS(1, 0), scan.consistent, scan.txn)
+		kvs, intents, err := MVCCScan(context.Background(), engine, testKey1, testKey4.Next(), math.MaxInt64, makeTS(1, 0), scan.consistent, scan.txn)
 		wiErr, _ := err.(*roachpb.WriteIntentError)
 		if (err == nil) != (wiErr == nil) {
 			t.Errorf("%s(%d): unexpected error: %s", cStr, i, err)
@@ -1148,7 +1155,7 @@ func TestMVCCScan(t *testing.T) {
 	err = MVCCPut(context.Background(), engine, nil, testKey4, makeTS(1, 0), value4, nil)
 	err = MVCCPut(context.Background(), engine, nil, testKey4, makeTS(5, 0), value1, nil)
 
-	kvs, _, err := MVCCScan(context.Background(), engine, testKey2, testKey4, 0, makeTS(1, 0), true, nil)
+	kvs, _, err := MVCCScan(context.Background(), engine, testKey2, testKey4, math.MaxInt64, makeTS(1, 0), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1160,7 +1167,7 @@ func TestMVCCScan(t *testing.T) {
 		t.Fatal("the value should not be empty")
 	}
 
-	kvs, _, err = MVCCScan(context.Background(), engine, testKey2, testKey4, 0, makeTS(4, 0), true, nil)
+	kvs, _, err = MVCCScan(context.Background(), engine, testKey2, testKey4, math.MaxInt64, makeTS(4, 0), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1172,7 +1179,7 @@ func TestMVCCScan(t *testing.T) {
 		t.Fatal("the value should not be empty")
 	}
 
-	kvs, _, err = MVCCScan(context.Background(), engine, testKey4, keyMax, 0, makeTS(1, 0), true, nil)
+	kvs, _, err = MVCCScan(context.Background(), engine, testKey4, keyMax, math.MaxInt64, makeTS(1, 0), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1183,7 +1190,7 @@ func TestMVCCScan(t *testing.T) {
 	}
 
 	_, _, err = MVCCGet(context.Background(), engine, testKey1, makeTS(1, 0), true, txn2)
-	kvs, _, err = MVCCScan(context.Background(), engine, keyMin, testKey2, 0, makeTS(1, 0), true, nil)
+	kvs, _, err = MVCCScan(context.Background(), engine, keyMin, testKey2, math.MaxInt64, makeTS(1, 0), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1214,6 +1221,13 @@ func TestMVCCScanMaxNum(t *testing.T) {
 		!bytes.Equal(kvs[0].Value.RawBytes, value2.RawBytes) {
 		t.Fatal("the value should not be empty")
 	}
+	kvs, _, err = MVCCScan(context.Background(), engine, testKey2, testKey4, 0, makeTS(1, 0), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 0 {
+		t.Fatal("the value should be empty")
+	}
 }
 
 func TestMVCCScanWithKeyPrefix(t *testing.T) {
@@ -1239,7 +1253,7 @@ func TestMVCCScanWithKeyPrefix(t *testing.T) {
 	err = MVCCPut(context.Background(), engine, nil, roachpb.Key("/aa"), makeTS(3, 0), value3, nil)
 	err = MVCCPut(context.Background(), engine, nil, roachpb.Key("/b"), makeTS(1, 0), value3, nil)
 
-	kvs, _, err := MVCCScan(context.Background(), engine, roachpb.Key("/a"), roachpb.Key("/b"), 0, makeTS(2, 0), true, nil)
+	kvs, _, err := MVCCScan(context.Background(), engine, roachpb.Key("/a"), roachpb.Key("/b"), math.MaxInt64, makeTS(2, 0), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1271,7 +1285,7 @@ func TestMVCCScanInTxn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kvs, _, err := MVCCScan(context.Background(), engine, testKey2, testKey4, 0, makeTS(1, 0), true, txn1)
+	kvs, _, err := MVCCScan(context.Background(), engine, testKey2, testKey4, math.MaxInt64, makeTS(1, 0), true, txn1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1283,7 +1297,7 @@ func TestMVCCScanInTxn(t *testing.T) {
 		t.Fatal("the value should not be empty")
 	}
 
-	if _, _, err := MVCCScan(context.Background(), engine, testKey2, testKey4, 0, makeTS(1, 0), true, nil); err == nil {
+	if _, _, err := MVCCScan(context.Background(), engine, testKey2, testKey4, math.MaxInt64, makeTS(1, 0), true, nil); err == nil {
 		t.Fatal("expected error on uncommitted write intent")
 	}
 }
@@ -1297,7 +1311,7 @@ func TestMVCCScanInconsistent(t *testing.T) {
 	engine := createTestEngine(stopper)
 
 	// A scan with consistent=false should fail in a txn.
-	if _, _, err := MVCCScan(context.Background(), engine, keyMin, keyMax, 0, makeTS(1, 0), false, txn1); err == nil {
+	if _, _, err := MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(1, 0), false, txn1); err == nil {
 		t.Error("expected an error scanning with consistent=false in txn")
 	}
 
@@ -1330,7 +1344,7 @@ func TestMVCCScanInconsistent(t *testing.T) {
 		{Span: roachpb.Span{Key: testKey1}, Txn: txn1.TxnMeta},
 		{Span: roachpb.Span{Key: testKey3}, Txn: txn2.TxnMeta},
 	}
-	kvs, intents, err := MVCCScan(context.Background(), engine, testKey1, testKey4.Next(), 0, makeTS(7, 0), false, nil)
+	kvs, intents, err := MVCCScan(context.Background(), engine, testKey1, testKey4.Next(), math.MaxInt64, makeTS(7, 0), false, nil)
 	if !reflect.DeepEqual(intents, expIntents) {
 		t.Fatal(err)
 	}
@@ -1351,7 +1365,7 @@ func TestMVCCScanInconsistent(t *testing.T) {
 
 	// Now try a scan at a historical timestamp.
 	expIntents = expIntents[:1]
-	kvs, intents, err = MVCCScan(context.Background(), engine, testKey1, testKey4.Next(), 0, makeTS(3, 0), false, nil)
+	kvs, intents, err = MVCCScan(context.Background(), engine, testKey1, testKey4.Next(), math.MaxInt64, makeTS(3, 0), false, nil)
 	if !reflect.DeepEqual(intents, expIntents) {
 		t.Fatal(err)
 	}
@@ -1374,13 +1388,135 @@ func TestMVCCDeleteRange(t *testing.T) {
 	err = MVCCPut(context.Background(), engine, nil, testKey2, makeTS(1, 0), value2, nil)
 	err = MVCCPut(context.Background(), engine, nil, testKey3, makeTS(1, 0), value3, nil)
 	err = MVCCPut(context.Background(), engine, nil, testKey4, makeTS(1, 0), value4, nil)
+	err = MVCCPut(context.Background(), engine, nil, testKey5, makeTS(1, 0), value5, nil)
+	err = MVCCPut(context.Background(), engine, nil, testKey6, makeTS(1, 0), value6, nil)
 
-	deleted, err := MVCCDeleteRange(context.Background(), engine, nil, testKey2, testKey4, 0, makeTS(2, 0), nil, true)
+	// Attempt to delete two keys.
+	deleted, resumeKey, num, err := MVCCDeleteRange(
+		context.Background(), engine, nil, testKey2, testKey6, 2, makeTS(2, 0), nil, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != nil {
+		t.Fatal("the value should be empty")
+	}
+	if num != 2 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
+	}
+	if expected, actual := testKey4, resumeKey; !expected.Equal(actual) {
+		t.Fatalf("wrong resume key: expected %v found %v", expected, actual)
+	}
+	kvs, _, _ := MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
+	if len(kvs) != 4 ||
+		!bytes.Equal(kvs[0].Key, testKey1) ||
+		!bytes.Equal(kvs[1].Key, testKey4) ||
+		!bytes.Equal(kvs[2].Key, testKey5) ||
+		!bytes.Equal(kvs[3].Key, testKey6) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) ||
+		!bytes.Equal(kvs[1].Value.RawBytes, value4.RawBytes) ||
+		!bytes.Equal(kvs[2].Value.RawBytes, value5.RawBytes) ||
+		!bytes.Equal(kvs[3].Value.RawBytes, value6.RawBytes) {
+		t.Fatal("the value should not be empty")
+	}
+
+	// Attempt to delete no keys.
+	deleted, resumeKey, num, err = MVCCDeleteRange(
+		context.Background(), engine, nil, testKey2, testKey6, 0, makeTS(2, 0), nil, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != nil {
+		t.Fatal("the value should be empty")
+	}
+	if num != 0 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
+	}
+	if expected, actual := testKey2, resumeKey; !expected.Equal(actual) {
+		t.Fatalf("wrong resume key: expected %v found %v", expected, actual)
+	}
+	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
+	if len(kvs) != 4 ||
+		!bytes.Equal(kvs[0].Key, testKey1) ||
+		!bytes.Equal(kvs[1].Key, testKey4) ||
+		!bytes.Equal(kvs[2].Key, testKey5) ||
+		!bytes.Equal(kvs[3].Key, testKey6) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) ||
+		!bytes.Equal(kvs[1].Value.RawBytes, value4.RawBytes) ||
+		!bytes.Equal(kvs[2].Value.RawBytes, value5.RawBytes) ||
+		!bytes.Equal(kvs[3].Value.RawBytes, value6.RawBytes) {
+		t.Fatal("the value should not be empty")
+	}
+
+	deleted, resumeKey, num, err = MVCCDeleteRange(
+		context.Background(), engine, nil, testKey4, keyMax, math.MaxInt64, makeTS(2, 0), nil, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != nil {
+		t.Fatal("the value should be empty")
+	}
+	if num != 3 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
+	}
+	if resumeKey != nil {
+		t.Fatalf("wrong resume key: expected nil, found %v", resumeKey)
+	}
+	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
+	if len(kvs) != 1 ||
+		!bytes.Equal(kvs[0].Key, testKey1) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) {
+		t.Fatal("the value should not be empty")
+	}
+
+	deleted, resumeKey, num, err = MVCCDeleteRange(
+		context.Background(), engine, nil, keyMin, testKey2, math.MaxInt64, makeTS(2, 0), nil, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != nil {
+		t.Fatal("the value should not be empty")
+	}
+	if num != 1 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
+	}
+	if resumeKey != nil {
+		t.Fatalf("wrong resume key: expected nil, found %v", resumeKey)
+	}
+	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
+	if len(kvs) != 0 {
+		t.Fatal("the value should be empty")
+	}
+}
+
+func TestMVCCDeleteRangeReturnKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+	engine := createTestEngine(stopper)
+
+	err := MVCCPut(context.Background(), engine, nil, testKey1, makeTS(1, 0), value1, nil)
+	err = MVCCPut(context.Background(), engine, nil, testKey2, makeTS(1, 0), value2, nil)
+	err = MVCCPut(context.Background(), engine, nil, testKey3, makeTS(1, 0), value3, nil)
+	err = MVCCPut(context.Background(), engine, nil, testKey4, makeTS(1, 0), value4, nil)
+	err = MVCCPut(context.Background(), engine, nil, testKey5, makeTS(1, 0), value5, nil)
+	err = MVCCPut(context.Background(), engine, nil, testKey6, makeTS(1, 0), value6, nil)
+
+	// Attempt to delete two keys.
+	deleted, resumeKey, num, err := MVCCDeleteRange(
+		context.Background(), engine, nil, testKey2, testKey6, 2, makeTS(2, 0), nil, true,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(deleted) != 2 {
 		t.Fatal("the value should not be empty")
+	}
+	if num != 2 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
 	}
 	if expected, actual := testKey2, deleted[0]; !expected.Equal(actual) {
 		t.Fatalf("wrong key deleted: expected %v found %v", expected, actual)
@@ -1388,43 +1524,101 @@ func TestMVCCDeleteRange(t *testing.T) {
 	if expected, actual := testKey3, deleted[1]; !expected.Equal(actual) {
 		t.Fatalf("wrong key deleted: expected %v found %v", expected, actual)
 	}
-	kvs, _, _ := MVCCScan(context.Background(), engine, keyMin, keyMax, 0, makeTS(2, 0), true, nil)
-	if len(kvs) != 2 ||
+	if expected, actual := testKey4, resumeKey; !expected.Equal(actual) {
+		t.Fatalf("wrong resume key: expected %v found %v", expected, actual)
+	}
+	kvs, _, _ := MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
+	if len(kvs) != 4 ||
 		!bytes.Equal(kvs[0].Key, testKey1) ||
 		!bytes.Equal(kvs[1].Key, testKey4) ||
+		!bytes.Equal(kvs[2].Key, testKey5) ||
+		!bytes.Equal(kvs[3].Key, testKey6) ||
 		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) ||
-		!bytes.Equal(kvs[1].Value.RawBytes, value4.RawBytes) {
+		!bytes.Equal(kvs[1].Value.RawBytes, value4.RawBytes) ||
+		!bytes.Equal(kvs[2].Value.RawBytes, value5.RawBytes) ||
+		!bytes.Equal(kvs[3].Value.RawBytes, value6.RawBytes) {
 		t.Fatal("the value should not be empty")
 	}
 
-	deleted, err = MVCCDeleteRange(context.Background(), engine, nil, testKey4, keyMax, 0, makeTS(2, 0), nil, true)
+	// Attempt to delete no keys.
+	deleted, resumeKey, num, err = MVCCDeleteRange(
+		context.Background(), engine, nil, testKey2, testKey6, 0, makeTS(2, 0), nil, true,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(deleted) != 1 {
+	if deleted != nil {
+		t.Fatal("the value should be empty")
+	}
+	if num != 0 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
+	}
+	if expected, actual := testKey2, resumeKey; !expected.Equal(actual) {
+		t.Fatalf("wrong resume key: expected %v found %v", expected, actual)
+	}
+	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
+	if len(kvs) != 4 ||
+		!bytes.Equal(kvs[0].Key, testKey1) ||
+		!bytes.Equal(kvs[1].Key, testKey4) ||
+		!bytes.Equal(kvs[2].Key, testKey5) ||
+		!bytes.Equal(kvs[3].Key, testKey6) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) ||
+		!bytes.Equal(kvs[1].Value.RawBytes, value4.RawBytes) ||
+		!bytes.Equal(kvs[2].Value.RawBytes, value5.RawBytes) ||
+		!bytes.Equal(kvs[3].Value.RawBytes, value6.RawBytes) {
 		t.Fatal("the value should not be empty")
+	}
+
+	deleted, resumeKey, num, err = MVCCDeleteRange(
+		context.Background(), engine, nil, testKey4, keyMax, math.MaxInt64, makeTS(2, 0), nil, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 3 {
+		t.Fatal("the value should not be empty")
+	}
+	if num != 3 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
 	}
 	if expected, actual := testKey4, deleted[0]; !expected.Equal(actual) {
 		t.Fatalf("wrong key deleted: expected %v found %v", expected, actual)
 	}
-	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, 0, makeTS(2, 0), true, nil)
+	if expected, actual := testKey5, deleted[1]; !expected.Equal(actual) {
+		t.Fatalf("wrong key deleted: expected %v found %v", expected, actual)
+	}
+	if expected, actual := testKey6, deleted[2]; !expected.Equal(actual) {
+		t.Fatalf("wrong key deleted: expected %v found %v", expected, actual)
+	}
+	if resumeKey != nil {
+		t.Fatalf("wrong resume key: expected nil, found %v", resumeKey)
+	}
+	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
 	if len(kvs) != 1 ||
 		!bytes.Equal(kvs[0].Key, testKey1) ||
 		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) {
 		t.Fatal("the value should not be empty")
 	}
 
-	deleted, err = MVCCDeleteRange(context.Background(), engine, nil, keyMin, testKey2, 0, makeTS(2, 0), nil, true)
+	deleted, resumeKey, num, err = MVCCDeleteRange(
+		context.Background(), engine, nil, keyMin, testKey2, math.MaxInt64, makeTS(2, 0), nil, true,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(deleted) != 1 {
 		t.Fatal("the value should not be empty")
 	}
+	if num != 1 {
+		t.Fatalf("incorrect number of keys deleted: %d", num)
+	}
 	if expected, actual := testKey1, deleted[0]; !expected.Equal(actual) {
 		t.Fatalf("wrong key deleted: expected %v found %v", expected, actual)
 	}
-	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, 0, makeTS(2, 0), true, nil)
+	if resumeKey != nil {
+		t.Fatalf("wrong resume key: %v", resumeKey)
+	}
+	kvs, _, _ = MVCCScan(context.Background(), engine, keyMin, keyMax, math.MaxInt64, makeTS(2, 0), true, nil)
 	if len(kvs) != 0 {
 		t.Fatal("the value should be empty")
 	}
@@ -1444,13 +1638,13 @@ func TestMVCCDeleteRangeFailed(t *testing.T) {
 	err = MVCCPut(context.Background(), engine, nil, testKey3, makeTS(1, 0), value3, &txn)
 	err = MVCCPut(context.Background(), engine, nil, testKey4, makeTS(1, 0), value4, nil)
 
-	_, err = MVCCDeleteRange(context.Background(), engine, nil, testKey2, testKey4, 0, makeTS(1, 0), nil, false)
+	_, _, _, err = MVCCDeleteRange(context.Background(), engine, nil, testKey2, testKey4, math.MaxInt64, makeTS(1, 0), nil, false)
 	if err == nil {
 		t.Fatal("expected error on uncommitted write intent")
 	}
 
 	txn.Sequence++
-	_, err = MVCCDeleteRange(context.Background(), engine, nil, testKey2, testKey4, 0, makeTS(1, 0), &txn, false)
+	_, _, _, err = MVCCDeleteRange(context.Background(), engine, nil, testKey2, testKey4, math.MaxInt64, makeTS(1, 0), &txn, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1467,7 +1661,7 @@ func TestMVCCDeleteRangeConcurrentTxn(t *testing.T) {
 	err = MVCCPut(context.Background(), engine, nil, testKey3, makeTS(2, 0), value3, txn2)
 	err = MVCCPut(context.Background(), engine, nil, testKey4, makeTS(1, 0), value4, nil)
 
-	_, err = MVCCDeleteRange(context.Background(), engine, nil, testKey2, testKey4, 0, makeTS(1, 0), txn1, false)
+	_, _, _, err = MVCCDeleteRange(context.Background(), engine, nil, testKey2, testKey4, math.MaxInt64, makeTS(1, 0), txn1, false)
 	if err == nil {
 		t.Fatal("expected error on uncommitted write intent")
 	}
@@ -1504,14 +1698,14 @@ func TestMVCCUncommittedDeleteRangeVisible(t *testing.T) {
 	}
 
 	txn := txn1.Clone()
-	if _, err := MVCCDeleteRange(
-		context.Background(), engine, nil, testKey1, testKey4, 0, makeTS(2, 0), &txn, false,
+	if _, _, _, err := MVCCDeleteRange(
+		context.Background(), engine, nil, testKey1, testKey4, math.MaxInt64, makeTS(2, 0), &txn, false,
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	txn.Epoch++
-	kvs, _, _ := MVCCScan(context.Background(), engine, testKey1, testKey4, 0, makeTS(3, 0), true, &txn)
+	kvs, _, _ := MVCCScan(context.Background(), engine, testKey1, testKey4, math.MaxInt64, makeTS(3, 0), true, &txn)
 	if e := 2; len(kvs) != e {
 		t.Fatalf("e = %d, got %d", e, len(kvs))
 	}
@@ -1862,7 +2056,7 @@ func TestMVCCReverseScan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kvs, _, err := MVCCReverseScan(context.Background(), engine, testKey2, testKey4, 0, makeTS(1, 0), true, nil)
+	kvs, _, err := MVCCReverseScan(context.Background(), engine, testKey2, testKey4, math.MaxInt64, makeTS(1, 0), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1871,6 +2065,23 @@ func TestMVCCReverseScan(t *testing.T) {
 		!bytes.Equal(kvs[1].Key, testKey2) ||
 		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) ||
 		!bytes.Equal(kvs[1].Value.RawBytes, value3.RawBytes) {
+		t.Errorf("unexpected value: %v", kvs)
+	}
+
+	kvs, _, err = MVCCReverseScan(context.Background(), engine, testKey2, testKey4, 1, makeTS(1, 0), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 1 ||
+		!bytes.Equal(kvs[0].Key, testKey3) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value1.RawBytes) {
+		t.Errorf("unexpected value: %v", kvs)
+	}
+	kvs, _, err = MVCCReverseScan(context.Background(), engine, testKey2, testKey4, 0, makeTS(1, 0), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 0 {
 		t.Errorf("unexpected value: %v", kvs)
 	}
 }
@@ -1943,6 +2154,59 @@ func TestMVCCResolveNewerIntent(t *testing.T) {
 	}
 	if !bytes.Equal(value1.RawBytes, value.RawBytes) {
 		t.Fatalf("expected value1 bytes; got %q", value.RawBytes)
+	}
+}
+
+func TestMVCCResolveIntentTxnTimestampMismatch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+	engine := createTestEngine(stopper)
+
+	txn := txn1.Clone()
+	tsEarly := txn.Timestamp
+	txn.TxnMeta.Timestamp.Forward(tsEarly.Add(10, 0))
+
+	// Write an intent which has txn.Timestamp > meta.timestamp.
+	if err := MVCCPut(
+		context.Background(), engine, nil, testKey1, tsEarly, value1, &txn,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	intent := roachpb.Intent{
+		Span:   roachpb.Span{Key: testKey1},
+		Status: roachpb.PENDING,
+		// The Timestamp within is equal to that of txn.Meta even though
+		// the intent sits at tsEarly. The bug was looking at the former
+		// instead of the latter (and so we could also tickle it with
+		// smaller timestamps in Txn).
+		Txn: txn.TxnMeta,
+	}
+
+	// A bug (see #7654) caused intents to just stay where they were instead
+	// of being moved forward in the situation set up above.
+	if err := MVCCResolveWriteIntent(context.Background(), engine, nil, intent); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, test := range []struct {
+		hlc.Timestamp
+		found bool
+	}{
+		// Check that the intent has indeed moved to where we pushed it.
+		{tsEarly, false},
+		{intent.Txn.Timestamp.Prev(), false},
+		{intent.Txn.Timestamp, true},
+		{hlc.MaxTimestamp, true},
+	} {
+		_, _, err := MVCCGet(
+			context.Background(), engine, testKey1, test.Timestamp, true, nil,
+		)
+
+		if _, ok := err.(*roachpb.WriteIntentError); ok != test.found {
+			t.Fatalf("%d: expected write intent error: %t, got %v", i, test.found, err)
+		}
 	}
 }
 
@@ -2458,11 +2722,11 @@ func TestMVCCResolveTxnRange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	num, err := MVCCResolveWriteIntentRange(context.Background(), engine, nil, roachpb.Intent{Span: roachpb.Span{Key: testKey1, EndKey: testKey4.Next()}, Txn: txn1Commit.TxnMeta, Status: txn1Commit.Status}, 0)
+	num, err := MVCCResolveWriteIntentRange(context.Background(), engine, nil, roachpb.Intent{Span: roachpb.Span{Key: testKey1, EndKey: testKey4.Next()}, Txn: txn1Commit.TxnMeta, Status: txn1Commit.Status}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if num != 4 {
+	if num != 3 {
 		t.Fatalf("expected all keys to process for resolution, even though 2 are noops; got %d", num)
 	}
 
@@ -2499,14 +2763,11 @@ func TestMVCCResolveTxnRange(t *testing.T) {
 		}
 	}
 
+	// The fourth key is unresolved.
 	{
-		value, _, err := MVCCGet(context.Background(), engine, testKey4, makeTS(0, 1), true, nil)
-		if err != nil {
+		_, _, err := MVCCGet(context.Background(), engine, testKey4, makeTS(0, 1), true, nil)
+		if !testutils.IsError(err, "conflicting intents on") {
 			t.Fatal(err)
-		}
-		if !bytes.Equal(value4.RawBytes, value.RawBytes) {
-			t.Fatalf("the value %s in get result does not match the value %s in request",
-				value4.RawBytes, value.RawBytes)
 		}
 	}
 }
@@ -2820,6 +3081,9 @@ func encodedSize(msg proto.Message, t *testing.T) int64 {
 }
 
 func verifyStats(debug string, ms, expMS *enginepb.MVCCStats, t *testing.T) {
+	if ms.ContainsEstimates != expMS.ContainsEstimates {
+		t.Errorf("%s: mvcc contains estimates %t; expected %t", debug, ms.ContainsEstimates, expMS.ContainsEstimates)
+	}
 	if ms.LiveBytes != expMS.LiveBytes {
 		t.Errorf("%s: mvcc live bytes %d; expected %d", debug, ms.LiveBytes, expMS.LiveBytes)
 	}
@@ -3080,7 +3344,7 @@ func TestMVCCStatsBasic(t *testing.T) {
 func TestMVCCStatsWithRandomRuns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	rng, seed := randutil.NewPseudoRand()
-	log.Infof("using pseudo random number generator with seed %d", seed)
+	log.Infof(context.Background(), "using pseudo random number generator with seed %d", seed)
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	engine := createTestEngine(stopper)
@@ -3098,7 +3362,7 @@ func TestMVCCStatsWithRandomRuns(t *testing.T) {
 		lastWT = ts.WallTime
 
 		if log.V(1) {
-			log.Infof("*** cycle %d @ %s", i, ts)
+			log.Infof(context.Background(), "*** cycle %d @ %s", i, ts)
 		}
 		// Manually advance aggregate intent age based on one extra second of simulation.
 		// Same for aggregate gc'able bytes age.
@@ -3117,14 +3381,14 @@ func TestMVCCStatsWithRandomRuns(t *testing.T) {
 		if i > 0 && isDelete {
 			idx := rng.Int31n(i)
 			if log.V(1) {
-				log.Infof("*** DELETE index %d", idx)
+				log.Infof(context.Background(), "*** DELETE index %d", idx)
 			}
 			if err := MVCCDelete(context.Background(), engine, ms, keys[idx], ts, txn); err != nil {
 				// Abort any write intent on an earlier, unresolved txn.
 				if wiErr, ok := err.(*roachpb.WriteIntentError); ok {
 					wiErr.Intents[0].Status = roachpb.ABORTED
 					if log.V(1) {
-						log.Infof("*** ABORT index %d", idx)
+						log.Infof(context.Background(), "*** ABORT index %d", idx)
 					}
 					// Note that this already incorporates committing an intent
 					// at a later time (since we use a potentially later ts here
@@ -3134,7 +3398,7 @@ func TestMVCCStatsWithRandomRuns(t *testing.T) {
 					}
 					// Now, re-delete.
 					if log.V(1) {
-						log.Infof("*** RE-DELETE index %d", idx)
+						log.Infof(context.Background(), "*** RE-DELETE index %d", idx)
 					}
 					if err := MVCCDelete(context.Background(), engine, ms, keys[idx], ts, txn); err != nil {
 						t.Fatal(err)
@@ -3146,7 +3410,7 @@ func TestMVCCStatsWithRandomRuns(t *testing.T) {
 		} else {
 			rngVal := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, int(rng.Int31n(128))))
 			if log.V(1) {
-				log.Infof("*** PUT index %d; TXN=%t", i, txn != nil)
+				log.Infof(context.Background(), "*** PUT index %d; TXN=%t", i, txn != nil)
 			}
 			if err := MVCCPut(context.Background(), engine, ms, key, ts, rngVal, txn); err != nil {
 				t.Fatal(err)
@@ -3158,7 +3422,7 @@ func TestMVCCStatsWithRandomRuns(t *testing.T) {
 				txn.Status = roachpb.ABORTED
 			}
 			if log.V(1) {
-				log.Infof("*** RESOLVE index %d; COMMIT=%t", i, txn.Status == roachpb.COMMITTED)
+				log.Infof(context.Background(), "*** RESOLVE index %d; COMMIT=%t", i, txn.Status == roachpb.COMMITTED)
 			}
 			if err := MVCCResolveWriteIntent(context.Background(), engine, ms, roachpb.Intent{Span: roachpb.Span{Key: key}, Status: txn.Status, Txn: txn.TxnMeta}); err != nil {
 				t.Fatal(err)
@@ -3242,7 +3506,7 @@ func TestMVCCGarbageCollect(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i, kv := range kvsn {
-			log.Infof("%d: %s", i, kv.Key)
+			log.Infof(context.Background(), "%d: %s", i, kv.Key)
 		}
 	}
 
@@ -3441,7 +3705,9 @@ func TestMVCCTimeSeriesPartialMerge(t *testing.T) {
 		}
 
 		if i == 1 {
-			engine.(InMem).Compact()
+			if err := engine.(InMem).Compact(); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		if err := MVCCMerge(context.Background(), engine, nil, k, makeTS(0, 2), tsvalue2); err != nil {
@@ -3452,7 +3718,9 @@ func TestMVCCTimeSeriesPartialMerge(t *testing.T) {
 		}
 
 		if i == 1 {
-			engine.(InMem).Compact()
+			if err := engine.(InMem).Compact(); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		if v, _, err := MVCCGet(context.Background(), engine, k, hlc.ZeroTimestamp, true, nil); err != nil {

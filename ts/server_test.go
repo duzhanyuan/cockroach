@@ -23,7 +23,9 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/ts"
 	"github.com/cockroachdb/cockroach/ts/tspb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
@@ -31,11 +33,9 @@ import (
 
 func TestQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	var tsrv server.TestServer
-	if err := tsrv.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer tsrv.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	tsrv := s.(*server.TestServer)
 
 	// Populate data directly.
 	tsdb := tsrv.TsDB()
@@ -105,11 +105,8 @@ func TestQuery(t *testing.T) {
 		Results: []tspb.TimeSeriesQueryResponse_Result{
 			{
 				Query: tspb.Query{
-					Name:             "test.metric",
-					Sources:          []string{"source1", "source2"},
-					Downsampler:      tspb.TimeSeriesQueryAggregator_AVG.Enum(),
-					SourceAggregator: tspb.TimeSeriesQueryAggregator_SUM.Enum(),
-					Derivative:       tspb.TimeSeriesQueryDerivative_NONE.Enum(),
+					Name:    "test.metric",
+					Sources: []string{"source1", "source2"},
 				},
 				Datapoints: []tspb.TimeSeriesDatapoint{
 					{
@@ -128,11 +125,8 @@ func TestQuery(t *testing.T) {
 			},
 			{
 				Query: tspb.Query{
-					Name:             "other.metric",
-					Sources:          []string{""},
-					Downsampler:      tspb.TimeSeriesQueryAggregator_AVG.Enum(),
-					SourceAggregator: tspb.TimeSeriesQueryAggregator_SUM.Enum(),
-					Derivative:       tspb.TimeSeriesQueryDerivative_NONE.Enum(),
+					Name:    "other.metric",
+					Sources: []string{""},
 				},
 				Datapoints: []tspb.TimeSeriesDatapoint{
 					{

@@ -30,10 +30,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
+
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server/serverpb"
@@ -41,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/timeutil"
@@ -78,16 +81,16 @@ func getJSON(url string) (interface{}, error) {
 }
 
 // debugURL returns the root debug URL.
-func debugURL(s TestServer) string {
-	return s.Ctx.AdminURL() + debugEndpoint
+func debugURL(s serverutils.TestServerInterface) string {
+	return s.AdminURL() + debugEndpoint
 }
 
 // TestAdminDebugExpVar verifies that cmdline and memstats variables are
 // available via the /debug/vars link.
 func TestAdminDebugExpVar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	jI, err := getJSON(debugURL(s) + "vars")
 	if err != nil {
@@ -106,8 +109,8 @@ func TestAdminDebugExpVar(t *testing.T) {
 // available via the /debug/metrics link.
 func TestAdminDebugMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	jI, err := getJSON(debugURL(s) + "metrics")
 	if err != nil {
@@ -126,8 +129,8 @@ func TestAdminDebugMetrics(t *testing.T) {
 // via the /debug/pprof/* links.
 func TestAdminDebugPprof(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	body, err := getText(debugURL(s) + "pprof/block")
 	if err != nil {
@@ -142,8 +145,8 @@ func TestAdminDebugPprof(t *testing.T) {
 // via /debug/{requests,events}.
 func TestAdminDebugTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	tc := []struct {
 		segment, search string
@@ -167,8 +170,8 @@ func TestAdminDebugTrace(t *testing.T) {
 // incorrect /debug/ paths.
 func TestAdminDebugRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	expURL := debugURL(s)
 	origURL := expURL + "incorrect"
@@ -207,36 +210,38 @@ func TestAdminDebugRedirect(t *testing.T) {
 
 // apiGet issues a GET to the provided server using the given API path and
 // marshals the result into response.
-func apiGet(s TestServer, path string, response proto.Message) error {
+func apiGet(s serverutils.TestServerInterface, path string, response proto.Message) error {
 	apiPath := apiEndpoint + path
-	client, err := s.Ctx.GetHTTPClient()
+	client, err := s.GetHTTPClient()
 	if err != nil {
 		return err
 	}
-	return util.GetJSON(client, s.Ctx.AdminURL()+apiPath, response)
+	return util.GetJSON(client, s.AdminURL()+apiPath, response)
 }
 
 // apiPost issues a POST to the provided server using the given API path and
 // request, marshalling the result into response.
-func apiPost(s TestServer, path string, request, response proto.Message) error {
+func apiPost(s serverutils.TestServerInterface, path string, request, response proto.Message) error {
 	apiPath := apiEndpoint + path
-	client, err := s.Ctx.GetHTTPClient()
+	client, err := s.GetHTTPClient()
 	if err != nil {
 		return err
 	}
-	return util.PostJSON(client, s.Ctx.AdminURL()+apiPath, request, response)
+	return util.PostJSON(client, s.AdminURL()+apiPath, request, response)
 }
 
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
 	// Test databases endpoint.
 	const testdb = "test"
-	session := sql.NewSession(sql.SessionArgs{User: security.RootUser}, s.sqlExecutor, nil)
+	session := sql.NewSession(
+		context.Background(), sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor, nil)
 	query := "CREATE DATABASE " + testdb
-	createRes := s.sqlExecutor.ExecuteStatements(context.Background(), session, query, nil)
+	createRes := ts.sqlExecutor.ExecuteStatements(session, query, nil)
 	if createRes.ResultList[0].Err != nil {
 		t.Fatal(createRes.ResultList[0].Err)
 	}
@@ -246,24 +251,26 @@ func TestAdminAPIDatabases(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// We should have the system database and the newly created test database.
-	if a, e := len(resp.Databases), 2; a != e {
+	// We should have three databases:
+	// - system database
+	// - information_schema
+	// - newly created test database
+	if a, e := len(resp.Databases), 3; a != e {
 		t.Fatalf("length of result %d != expected %d", a, e)
 	}
 
 	sort.Strings(resp.Databases)
-	if a, e := resp.Databases[0], "system"; a != e {
-		t.Fatalf("database name %s != expected %s", a, e)
-	}
-	if a, e := resp.Databases[1], testdb; a != e {
-		t.Fatalf("database name %s != expected %s", a, e)
+	for i, e := range []string{"information_schema", "system", testdb} {
+		if a := resp.Databases[i]; a != e {
+			t.Fatalf("database name %s != expected %s", a, e)
+		}
 	}
 
 	// Test database details endpoint.
 	privileges := []string{"SELECT", "UPDATE"}
 	testuser := "testuser"
 	grantQuery := "GRANT " + strings.Join(privileges, ", ") + " ON DATABASE " + testdb + " TO " + testuser
-	grantRes := s.sqlExecutor.ExecuteStatements(context.Background(), session, grantQuery, nil)
+	grantRes := s.(*TestServer).sqlExecutor.ExecuteStatements(session, grantQuery, nil)
 	if grantRes.ResultList[0].Err != nil {
 		t.Fatal(grantRes.ResultList[0].Err)
 	}
@@ -296,8 +303,8 @@ func TestAdminAPIDatabases(t *testing.T) {
 
 func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	if err := apiGet(s, "databases/I_DO_NOT_EXIST", nil); !testutils.IsError(err, "database.+does not exist") {
 		t.Fatalf("unexpected error: %s", err)
@@ -306,8 +313,8 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 
 func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	const fakedb = "system;DROP DATABASE system;"
 	const path = "databases/" + fakedb
@@ -319,8 +326,8 @@ func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 
 func TestAdminAPITableDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	const fakename = "I_DO_NOT_EXIST"
 	const badDBPath = "databases/" + fakename + "/tables/foo"
@@ -338,8 +345,8 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 
 func TestAdminAPITableSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	const fakeTable = "users;DROP DATABASE system;"
 	const path = "databases/system/tables/" + fakeTable
@@ -351,10 +358,12 @@ func TestAdminAPITableSQLInjection(t *testing.T) {
 
 func TestAdminAPITableDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
-	session := sql.NewSession(sql.SessionArgs{User: security.RootUser}, s.sqlExecutor, nil)
+	session := sql.NewSession(
+		context.Background(), sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor, nil)
 	setupQueries := []string{
 		"CREATE DATABASE test",
 		`
@@ -370,7 +379,7 @@ CREATE TABLE test.tbl (
 	}
 
 	for _, q := range setupQueries {
-		res := s.sqlExecutor.ExecuteStatements(context.Background(), session, q, nil)
+		res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
 		if res.ResultList[0].Err != nil {
 			t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
 		}
@@ -447,7 +456,7 @@ CREATE TABLE test.tbl (
 			createTableCol       = "CreateTable"
 		)
 
-		resSet := s.sqlExecutor.ExecuteStatements(context.Background(), session, showCreateTableQuery, nil)
+		resSet := ts.sqlExecutor.ExecuteStatements(session, showCreateTableQuery, nil)
 		res := resSet.ResultList[0]
 		if res.Err != nil {
 			t.Fatalf("error executing '%s': %s", showCreateTableQuery, res.Err)
@@ -467,17 +476,19 @@ CREATE TABLE test.tbl (
 
 func TestAdminAPITableDetailsZone(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
 	// Create database and table.
-	session := sql.NewSession(sql.SessionArgs{User: security.RootUser}, s.sqlExecutor, nil)
+	session := sql.NewSession(
+		context.Background(), sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor, nil)
 	setupQueries := []string{
 		"CREATE DATABASE test",
 		"CREATE TABLE test.tbl (val STRING)",
 	}
 	for _, q := range setupQueries {
-		res := s.sqlExecutor.ExecuteStatements(context.Background(), session, q, nil)
+		res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
 		if res.ResultList[0].Err != nil {
 			t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
 		}
@@ -510,7 +521,7 @@ func TestAdminAPITableDetailsZone(t *testing.T) {
 		params := parser.NewPlaceholderInfo()
 		params.SetValue(`1`, parser.NewDInt(parser.DInt(id)))
 		params.SetValue(`2`, parser.NewDBytes(parser.DBytes(zoneBytes)))
-		res := s.sqlExecutor.ExecuteStatements(context.Background(), session, query, params)
+		res := ts.sqlExecutor.ExecuteStatements(session, query, params)
 		if res.ResultList[0].Err != nil {
 			t.Fatalf("error executing '%s': %s", query, res.ResultList[0].Err)
 		}
@@ -521,7 +532,7 @@ func TestAdminAPITableDetailsZone(t *testing.T) {
 
 	// Get ID path for table. This will be an array of three IDs, containing the ID of the root namespace,
 	// the database, and the table (in that order).
-	idPath, err := s.admin.queryDescriptorIDPath(context.Background(), session, []string{"test", "tbl"})
+	idPath, err := ts.admin.queryDescriptorIDPath(session, []string{"test", "tbl"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,15 +554,17 @@ func TestAdminAPITableDetailsZone(t *testing.T) {
 
 func TestAdminAPIUsers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
 	// Create sample users.
-	session := sql.NewSession(sql.SessionArgs{User: security.RootUser}, s.sqlExecutor, nil)
+	session := sql.NewSession(
+		context.Background(), sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor, nil)
 	query := `
 INSERT INTO system.users (username, hashedPassword)
 VALUES ('admin', 'abc'), ('bob', 'xyz')`
-	res := s.sqlExecutor.ExecuteStatements(context.Background(), session, query, nil)
+	res := ts.sqlExecutor.ExecuteStatements(session, query, nil)
 	if a, e := len(res.ResultList), 1; a != e {
 		t.Fatalf("len(results) %d != %d", a, e)
 	} else if res.ResultList[0].Err != nil {
@@ -581,10 +594,12 @@ VALUES ('admin', 'abc'), ('bob', 'xyz')`
 
 func TestAdminAPIEvents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
-	session := sql.NewSession(sql.SessionArgs{User: security.RootUser}, s.sqlExecutor, nil)
+	session := sql.NewSession(
+		context.Background(), sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor, nil)
 	setupQueries := []string{
 		"CREATE DATABASE api_test",
 		"CREATE TABLE api_test.tbl1 (a INT)",
@@ -594,7 +609,7 @@ func TestAdminAPIEvents(t *testing.T) {
 		"DROP TABLE api_test.tbl2",
 	}
 	for _, q := range setupQueries {
-		res := s.sqlExecutor.ExecuteStatements(context.Background(), session, q, nil)
+		res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
 		if res.ResultList[0].Err != nil {
 			t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
 		}
@@ -664,8 +679,8 @@ func TestAdminAPIEvents(t *testing.T) {
 
 func TestAdminAPIUIData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	start := timeutil.Now()
 
@@ -765,10 +780,10 @@ func TestAdminAPIUIData(t *testing.T) {
 	expectValueEquals("bin", buf.Bytes())
 }
 
-func TestCluster(t *testing.T) {
+func TestClusterAPI(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	// We need to retry, because the cluster ID isn't set until after
 	// bootstrapping.
@@ -777,7 +792,7 @@ func TestCluster(t *testing.T) {
 		if err := apiGet(s, "cluster", &resp); err != nil {
 			return err
 		}
-		if a, e := resp.ClusterID, s.node.ClusterID.String(); a != e {
+		if a, e := resp.ClusterID, s.(*TestServer).node.ClusterID.String(); a != e {
 			return errors.Errorf("cluster ID %s != expected %s", a, e)
 		}
 		return nil
@@ -786,8 +801,8 @@ func TestCluster(t *testing.T) {
 
 func TestClusterFreeze(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	for _, freeze := range []bool{true, false} {
 		req := serverpb.ClusterFreezeRequest{
@@ -803,11 +818,11 @@ func TestClusterFreeze(t *testing.T) {
 			}
 		}
 
-		cli, err := s.ctx.GetHTTPClient()
+		cli, err := s.GetHTTPClient()
 		if err != nil {
 			t.Fatal(err)
 		}
-		path := s.Ctx.AdminURL() + apiEndpoint + "cluster/freeze"
+		path := s.AdminURL() + apiEndpoint + "cluster/freeze"
 
 		if err := util.StreamJSON(cli, path, &req, &serverpb.ClusterFreezeResponse{}, cb); err != nil {
 			t.Fatal(err)

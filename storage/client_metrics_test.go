@@ -17,9 +17,12 @@
 package storage_test
 
 import (
+	"sync"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/util/leaktest"
@@ -54,56 +57,83 @@ func checkCounter(t *testing.T, s *storage.Store, key string, e int64) {
 	}
 }
 
-func verifyStats(t *testing.T, mtc *multiTestContext, storeIdx int) {
-	// Get the current store at storeIdx.
-	s := mtc.stores[storeIdx]
-	// Stop the store at the given index, while keeping the reference to the
-	// store object. ComputeMVCCStats() still works on a stopped store (it needs
+func verifyStats(t *testing.T, mtc *multiTestContext, storeIdxSlice ...int) {
+	var stores []*storage.Store
+	var wg sync.WaitGroup
+
+	mtc.mu.RLock()
+	numStores := len(mtc.stores)
+	// We need to stop the stores at the given indexes, while keeping the reference to the
+	// store objects. ComputeMVCCStats() still works on a stopped store (it needs
 	// only the engine, which is still open), and the most recent stats are still
 	// available on the stopped store object; however, no further information can
 	// be committed to the store while it is stopped, preventing any races during
 	// verification.
-	mtc.stopStore(storeIdx)
+	for _, storeIdx := range storeIdxSlice {
+		stores = append(stores, mtc.stores[storeIdx])
+	}
+	mtc.mu.RUnlock()
 
-	// Compute real total MVCC statistics from store.
-	realStats, err := s.ComputeMVCCStats()
-	if err != nil {
-		t.Fatal(err)
+	wg.Add(numStores)
+	// We actually stop *all* of the Stores. Stopping only a few is riddled
+	// with deadlocks since operations can span nodes, but stoppers don't
+	// know about this - taking all of them down at the same time is the
+	// only sane way of guaranteeing that nothing interesting happens, at
+	// least when bringing down the nodes jeopardizes majorities.
+	for i := 0; i < numStores; i++ {
+		go func(i int) {
+			defer wg.Done()
+			mtc.stopStore(i)
+		}(i)
+	}
+	wg.Wait()
+
+	for _, s := range stores {
+		fatalf := func(msg string, args ...interface{}) {
+			prefix := s.Ident.String() + ": "
+			t.Fatalf(prefix+msg, args...)
+		}
+		// Compute real total MVCC statistics from store.
+		realStats, err := s.ComputeMVCCStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Sanity regression check for bug #4624: ensure intent count is zero.
+		if a := realStats.IntentCount; a != 0 {
+			fatalf("expected intent count to be zero, was %d", a)
+		}
+
+		// Sanity check: LiveBytes is not zero (ensures we don't have
+		// zeroed out structures.)
+		if liveBytes := getGauge(t, s, "livebytes"); liveBytes == 0 {
+			fatalf("expected livebytes to be non-zero, was zero")
+		}
+
+		// Ensure that real MVCC stats match computed stats.
+		checkGauge(t, s, "livebytes", realStats.LiveBytes)
+		checkGauge(t, s, "keybytes", realStats.KeyBytes)
+		checkGauge(t, s, "valbytes", realStats.ValBytes)
+		checkGauge(t, s, "intentbytes", realStats.IntentBytes)
+		checkGauge(t, s, "livecount", realStats.LiveCount)
+		checkGauge(t, s, "keycount", realStats.KeyCount)
+		checkGauge(t, s, "valcount", realStats.ValCount)
+		checkGauge(t, s, "intentcount", realStats.IntentCount)
+		checkGauge(t, s, "sysbytes", realStats.SysBytes)
+		checkGauge(t, s, "syscount", realStats.SysCount)
+		// "Ages" will be different depending on how much time has passed. Even with
+		// a manual clock, this can be an issue in tests. Therefore, we do not
+		// verify them in this test.
+
+		if t.Failed() {
+			fatalf("verifyStats failed, aborting test.")
+		}
 	}
 
-	// Sanity regression check for bug #4624: ensure intent count is zero.
-	if a := realStats.IntentCount; a != 0 {
-		t.Fatalf("Expected intent count to be zero, was %d", a)
+	// Restart all Stores.
+	for i := 0; i < numStores; i++ {
+		mtc.restartStore(i)
 	}
-
-	// Sanity check: LiveBytes is not zero (ensures we don't have
-	// zeroed out structures.)
-	if liveBytes := getGauge(t, s, "livebytes"); liveBytes == 0 {
-		t.Fatal("Expected livebytes to be non-zero, was zero")
-	}
-
-	// Ensure that real MVCC stats match computed stats.
-	checkGauge(t, s, "livebytes", realStats.LiveBytes)
-	checkGauge(t, s, "keybytes", realStats.KeyBytes)
-	checkGauge(t, s, "valbytes", realStats.ValBytes)
-	checkGauge(t, s, "intentbytes", realStats.IntentBytes)
-	checkGauge(t, s, "livecount", realStats.LiveCount)
-	checkGauge(t, s, "keycount", realStats.KeyCount)
-	checkGauge(t, s, "valcount", realStats.ValCount)
-	checkGauge(t, s, "intentcount", realStats.IntentCount)
-	checkGauge(t, s, "sysbytes", realStats.SysBytes)
-	checkGauge(t, s, "syscount", realStats.SysCount)
-	// "Ages" will be different depending on how much time has passed. Even with
-	// a manual clock, this can be an issue in tests. Therefore, we do not
-	// verify them in this test.
-
-	if t.Failed() {
-		t.Log(errors.Errorf("verifyStats failed, aborting test."))
-		t.FailNow()
-	}
-
-	// Restart the store at the provided index.
-	mtc.restartStore(storeIdx)
 }
 
 func verifyRocksDBStats(t *testing.T, s *storage.Store) {
@@ -137,6 +167,7 @@ func verifyRocksDBStats(t *testing.T, s *storage.Store) {
 
 func TestStoreMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	t.Skip("TODO(mrtracy): #8437")
 	mtc := startMultiTestContext(t, 3)
 	defer mtc.Stop()
 
@@ -152,7 +183,7 @@ func TestStoreMetrics(t *testing.T) {
 
 	// Disable the raft log truncation which confuses this test.
 	for _, s := range mtc.stores {
-		s.DisableRaftLogQueue(true)
+		s.SetRaftLogQueueActive(false)
 	}
 
 	// Perform a split, which has special metrics handling.
@@ -182,13 +213,12 @@ func TestStoreMetrics(t *testing.T) {
 	mtc.waitForValues(roachpb.Key("z"), []int64{5, 5, 5})
 
 	// Verify all stats on store 0 and 1 after addition.
-	verifyStats(t, mtc, 0)
-	verifyStats(t, mtc, 1)
+	verifyStats(t, mtc, 0, 1)
 
 	// Create a transaction statement that fails, but will add an entry to the
 	// sequence cache. Regression test for #4969.
-	if err := mtc.dbs[0].Txn(func(txn *client.Txn) error {
-		b := &client.Batch{}
+	if err := mtc.dbs[0].Txn(context.TODO(), func(txn *client.Txn) error {
+		b := txn.NewBatch()
 		b.CPut(dataKey, 7, 6)
 		return txn.Run(b)
 	}); err == nil {
@@ -211,8 +241,7 @@ func TestStoreMetrics(t *testing.T) {
 	checkCounter(t, mtc.stores[1], "replicas", 1)
 
 	// Verify all stats on store0 and store1 after range is removed.
-	verifyStats(t, mtc, 0)
-	verifyStats(t, mtc, 1)
+	verifyStats(t, mtc, 0, 1)
 
 	verifyRocksDBStats(t, mtc.stores[0])
 	verifyRocksDBStats(t, mtc.stores[1])

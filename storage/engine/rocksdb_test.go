@@ -24,13 +24,17 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 const testCacheSize = 1 << 30 // 1 GB
@@ -38,7 +42,15 @@ const testCacheSize = 1 << 30 // 1 GB
 func TestMinMemtableBudget(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	rocksdb := NewRocksDB(roachpb.Attributes{}, ".", RocksDBCache{}, 0, 0, stop.NewStopper())
+	rocksdb := NewRocksDB(
+		roachpb.Attributes{},
+		".",
+		RocksDBCache{},
+		0,
+		0,
+		DefaultMaxOpenFiles,
+		stop.NewStopper(),
+	)
 	const expected = "memtable budget must be at least"
 	if err := rocksdb.Open(); !testutils.IsError(err, expected) {
 		t.Fatalf("expected %s, but got %v", expected, err)
@@ -231,7 +243,15 @@ func openRocksDBWithVersion(t *testing.T, hasVersionFile bool, ver Version) erro
 		}
 	}
 
-	rocksdb := NewRocksDB(roachpb.Attributes{}, dir, RocksDBCache{}, minMemtableBudget, 0, stopper)
+	rocksdb := NewRocksDB(
+		roachpb.Attributes{},
+		dir,
+		RocksDBCache{},
+		minMemtableBudget,
+		0,
+		DefaultMaxOpenFiles,
+		stopper,
+	)
 	return rocksdb.Open()
 }
 
@@ -253,7 +273,15 @@ func TestCheckpoint(t *testing.T) {
 		stopper := stop.NewStopper()
 		defer stopper.Stop()
 
-		db := NewRocksDB(roachpb.Attributes{}, dir, RocksDBCache{}, minMemtableBudget, 0, stopper)
+		db := NewRocksDB(
+			roachpb.Attributes{},
+			dir,
+			RocksDBCache{},
+			minMemtableBudget,
+			0,
+			DefaultMaxOpenFiles,
+			stopper,
+		)
 		if err := db.Open(); err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +308,15 @@ func TestCheckpoint(t *testing.T) {
 		defer stopper.Stop()
 
 		dir = filepath.Join(dir, "checkpoint")
-		db := NewRocksDB(roachpb.Attributes{}, dir, RocksDBCache{}, minMemtableBudget, 0, stopper)
+		db := NewRocksDB(
+			roachpb.Attributes{},
+			dir,
+			RocksDBCache{},
+			minMemtableBudget,
+			0,
+			DefaultMaxOpenFiles,
+			stopper,
+		)
 		if err := db.Open(); err != nil {
 			t.Fatal(err)
 		}
@@ -299,4 +335,224 @@ func TestCheckpoint(t *testing.T) {
 			t.Fatalf("expected %s, but got %s", expectedKeys, keys)
 		}
 	}()
+}
+
+func TestSSTableInfosString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	info := func(level int, size int64) SSTableInfo {
+		return SSTableInfo{
+			Level: level,
+			Size:  size,
+		}
+	}
+	tables := SSTableInfos{
+		info(1, 7<<20),
+		info(1, 1<<20),
+		info(1, 63<<10),
+		info(2, 10<<20),
+		info(2, 8<<20),
+		info(2, 13<<20),
+		info(2, 31<<20),
+		info(2, 13<<20),
+		info(2, 30<<20),
+		info(2, 5<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 9<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 93<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 122<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 129<<20),
+		info(3, 24<<20),
+		info(3, 18<<20),
+	}
+	expected := `1 [   8M  3 ]: 7M 1M 63K
+2 [ 110M  7 ]: 31M 30M 13M[2] 10M 8M 5M
+3 [   2G 19 ]: 129M[14] 122M 93M 24M 18M 9M
+`
+	sort.Sort(tables)
+	s := tables.String()
+	if expected != s {
+		t.Fatalf("expected\n%s\ngot\n%s", expected, s)
+	}
+}
+
+func TestReadAmplification(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	info := func(level int, size int64) SSTableInfo {
+		return SSTableInfo{
+			Level: level,
+			Size:  size,
+		}
+	}
+
+	tables1 := SSTableInfos{
+		info(0, 0),
+		info(0, 0),
+		info(0, 0),
+		info(1, 0),
+	}
+	if a, e := tables1.ReadAmplification(), 4; a != e {
+		t.Errorf("got %d, expected %d", a, e)
+	}
+
+	tables2 := SSTableInfos{
+		info(0, 0),
+		info(1, 0),
+		info(2, 0),
+		info(3, 0),
+	}
+	if a, e := tables2.ReadAmplification(), 4; a != e {
+		t.Errorf("got %d, expected %d", a, e)
+	}
+
+	tables3 := SSTableInfos{
+		info(1, 0),
+		info(0, 0),
+		info(0, 0),
+		info(0, 0),
+		info(1, 0),
+		info(1, 0),
+		info(2, 0),
+		info(3, 0),
+		info(6, 0),
+	}
+	if a, e := tables3.ReadAmplification(), 7; a != e {
+		t.Errorf("got %d, expected %d", a, e)
+	}
+}
+
+func BenchmarkRocksDBSstFileWriter(b *testing.B) {
+	dir, err := ioutil.TempDir("", "BenchmarkRocksDBSstFileWriter")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			b.Fatal(err)
+		}
+	}()
+
+	const maxEntries = 100000
+	const keyLen = 10
+	const valLen = 100
+	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+	kv := MVCCKeyValue{
+		Key:   MVCCKey{Key: roachpb.Key(make([]byte, keyLen)), Timestamp: ts},
+		Value: make([]byte, valLen),
+	}
+
+	b.ResetTimer()
+	sst := MakeRocksDBSstFileWriter()
+	if err := sst.Open(filepath.Join(dir, "sst")); err != nil {
+		b.Fatal(sst)
+	}
+	defer func() {
+		if err := sst.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}()
+	for i := 1; i <= b.N; i++ {
+		if i%maxEntries == 0 {
+			if err := sst.Close(); err != nil {
+				b.Fatal(err)
+			}
+			sst = MakeRocksDBSstFileWriter()
+			if err := sst.Open(filepath.Join(dir, "sst")); err != nil {
+				b.Fatal(sst)
+			}
+		}
+
+		b.StopTimer()
+		kv.Key.Key = []byte(fmt.Sprintf("%09d", i))
+		copy(kv.Value, kv.Key.Key)
+		b.StartTimer()
+		if err := sst.Add(kv); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.SetBytes(keyLen + valLen)
+}
+
+func BenchmarkRocksDBSstFileReader(b *testing.B) {
+	dir, err := ioutil.TempDir("", "BenchmarkRocksDBSstFileReader")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			b.Fatal(err)
+		}
+	}()
+
+	sstPath := filepath.Join(dir, "sst")
+	{
+		const maxEntries = 100000
+		const keyLen = 10
+		const valLen = 100
+		b.SetBytes(keyLen + valLen)
+
+		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+		kv := MVCCKeyValue{
+			Key:   MVCCKey{Key: roachpb.Key(make([]byte, keyLen)), Timestamp: ts},
+			Value: make([]byte, valLen),
+		}
+
+		sst := MakeRocksDBSstFileWriter()
+		if err := sst.Open(sstPath); err != nil {
+			b.Fatal(sst)
+		}
+		var entries = b.N
+		if entries > maxEntries {
+			entries = maxEntries
+		}
+		for i := 0; i < entries; i++ {
+			kv.Key.Key = []byte(fmt.Sprintf("%09d", i))
+			copy(kv.Value, kv.Key.Key)
+			if err := sst.Add(kv); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := sst.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ResetTimer()
+	sst, err := MakeRocksDBSstFileReader()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := sst.AddFile(sstPath); err != nil {
+		b.Fatal(err)
+	}
+	defer sst.Close()
+	count := 0
+	iterateFn := func(kv MVCCKeyValue) (bool, error) {
+		count++
+		if count >= b.N {
+			return true, nil
+		}
+		return false, nil
+	}
+	for {
+		if err := sst.Iterate(MVCCKey{Key: keys.MinKey}, MVCCKey{Key: keys.MaxKey}, iterateFn); err != nil {
+			b.Fatal(err)
+		}
+		if count >= b.N {
+			break
+		}
+	}
 }

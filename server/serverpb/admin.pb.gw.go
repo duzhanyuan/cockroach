@@ -13,9 +13,9 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/gengo/grpc-gateway/runtime"
-	"github.com/gengo/grpc-gateway/utilities"
 	"github.com/golang/protobuf/proto"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/grpc-ecosystem/grpc-gateway/utilities"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -110,6 +110,44 @@ func request_Admin_TableDetails_0(ctx context.Context, marshaler runtime.Marshal
 
 }
 
+func request_Admin_TableStats_0(ctx context.Context, marshaler runtime.Marshaler, client AdminClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq TableStatsRequest
+	var metadata runtime.ServerMetadata
+
+	var (
+		val string
+		ok  bool
+		err error
+		_   = err
+	)
+
+	val, ok = pathParams["database"]
+	if !ok {
+		return nil, metadata, grpc.Errorf(codes.InvalidArgument, "missing parameter %s", "database")
+	}
+
+	protoReq.Database, err = runtime.String(val)
+
+	if err != nil {
+		return nil, metadata, err
+	}
+
+	val, ok = pathParams["table"]
+	if !ok {
+		return nil, metadata, grpc.Errorf(codes.InvalidArgument, "missing parameter %s", "table")
+	}
+
+	protoReq.Table, err = runtime.String(val)
+
+	if err != nil {
+		return nil, metadata, err
+	}
+
+	msg, err := client.TableStats(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+
+}
+
 var (
 	filter_Admin_Events_0 = &utilities.DoubleArray{Encoding: map[string]int{}, Base: []int(nil), Check: []int(nil)}
 )
@@ -175,7 +213,7 @@ func request_Admin_Health_0(ctx context.Context, marshaler runtime.Marshaler, cl
 
 }
 
-func request_Admin_Drain_0(ctx context.Context, marshaler runtime.Marshaler, client AdminClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_Admin_Drain_0(ctx context.Context, marshaler runtime.Marshaler, client AdminClient, req *http.Request, pathParams map[string]string) (Admin_DrainClient, runtime.ServerMetadata, error) {
 	var protoReq DrainRequest
 	var metadata runtime.ServerMetadata
 
@@ -183,8 +221,16 @@ func request_Admin_Drain_0(ctx context.Context, marshaler runtime.Marshaler, cli
 		return nil, metadata, grpc.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
-	msg, err := client.Drain(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
-	return msg, metadata, err
+	stream, err := client.Drain(ctx, &protoReq)
+	if err != nil {
+		return nil, metadata, err
+	}
+	header, err := stream.Header()
+	if err != nil {
+		return nil, metadata, err
+	}
+	metadata.HeaderMD = header
+	return stream, metadata, nil
 
 }
 
@@ -348,6 +394,34 @@ func RegisterAdminHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc
 		}
 
 		forward_Admin_TableDetails_0(ctx, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+
+	})
+
+	mux.Handle("GET", pattern_Admin_TableStats_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		if cn, ok := w.(http.CloseNotifier); ok {
+			go func(done <-chan struct{}, closed <-chan bool) {
+				select {
+				case <-done:
+				case <-closed:
+					cancel()
+				}
+			}(ctx.Done(), cn.CloseNotify())
+		}
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		rctx, err := runtime.AnnotateContext(ctx, req)
+		if err != nil {
+			runtime.HTTPError(ctx, outboundMarshaler, w, req, err)
+		}
+		resp, md, err := request_Admin_TableStats_0(rctx, inboundMarshaler, client, req, pathParams)
+		ctx = runtime.NewServerMetadataContext(ctx, md)
+		if err != nil {
+			runtime.HTTPError(ctx, outboundMarshaler, w, req, err)
+			return
+		}
+
+		forward_Admin_TableStats_0(ctx, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 
 	})
 
@@ -515,7 +589,7 @@ func RegisterAdminHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc
 			return
 		}
 
-		forward_Admin_Drain_0(ctx, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+		forward_Admin_Drain_0(ctx, outboundMarshaler, w, req, func() (proto.Message, error) { return resp.Recv() }, mux.GetForwardResponseOptions()...)
 
 	})
 
@@ -559,6 +633,8 @@ var (
 
 	pattern_Admin_TableDetails_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3, 2, 4, 1, 0, 4, 1, 5, 5}, []string{"_admin", "v1", "databases", "database", "tables", "table"}, ""))
 
+	pattern_Admin_TableStats_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3, 2, 4, 1, 0, 4, 1, 5, 5, 2, 6}, []string{"_admin", "v1", "databases", "database", "tables", "table", "stats"}, ""))
+
 	pattern_Admin_Events_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"_admin", "v1", "events"}, ""))
 
 	pattern_Admin_SetUIData_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"_admin", "v1", "uidata"}, ""))
@@ -583,6 +659,8 @@ var (
 
 	forward_Admin_TableDetails_0 = runtime.ForwardResponseMessage
 
+	forward_Admin_TableStats_0 = runtime.ForwardResponseMessage
+
 	forward_Admin_Events_0 = runtime.ForwardResponseMessage
 
 	forward_Admin_SetUIData_0 = runtime.ForwardResponseMessage
@@ -593,7 +671,7 @@ var (
 
 	forward_Admin_Health_0 = runtime.ForwardResponseMessage
 
-	forward_Admin_Drain_0 = runtime.ForwardResponseMessage
+	forward_Admin_Drain_0 = runtime.ForwardResponseStream
 
 	forward_Admin_ClusterFreeze_0 = runtime.ForwardResponseStream
 )

@@ -66,6 +66,8 @@ typedef struct {
   uint64_t wal_ttl_seconds;
   bool allow_os_buffer;
   bool logging_enabled;
+  int num_cpu;
+  int max_open_files;
 } DBOptions;
 
 // Create a new cache with the specified size.
@@ -218,6 +220,40 @@ typedef struct {
 } DBStatsResult;
 
 DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats);
+
+typedef struct {
+  int level;
+  uint64_t size;
+  DBKey start_key;
+  DBKey end_key;
+} DBSSTable;
+
+// Retrieve stats about all of the live sstables. Note that the tables
+// array must be freed along with the start_key and end_key of each
+// table.
+DBSSTable* DBGetSSTables(DBEngine* db, int* n);
+
+// Bulk adds the file at the given path to a database. See the RocksDB
+// documentation on `AddFile` for the various restrictions on what can be added.
+DBStatus DBEngineAddFile(DBEngine* db, DBSlice path);
+
+typedef struct DBSstFileWriter DBSstFileWriter;
+
+// Creates a new SstFileWriter with the default configuration.
+DBSstFileWriter* DBSstFileWriterNew();
+
+// Opens a file at the given path for output of an sstable.
+DBStatus DBSstFileWriterOpen(DBSstFileWriter* fw, DBSlice path);
+
+// Adds a kv entry to the sstable being built. An error is returned if it is
+// not greater than any previously added entry (according to the comparator
+// configured during writer creation). `Open` must have been called. `Close`
+// cannot have been called.
+DBStatus DBSstFileWriterAdd(DBSstFileWriter* fw, DBKey key, DBSlice val);
+
+// Closes the writer, flushing any remaining writes to disk and freeing
+// memory and other resources. At least one kv entry must have been added.
+DBStatus DBSstFileWriterClose(DBSstFileWriter* fw);
 
 #ifdef __cplusplus
 }  // extern "C"

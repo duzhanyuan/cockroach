@@ -1,7 +1,9 @@
 import * as React from "react";
 import { connect } from "react-redux";
 import Banner from "./banner";
-import { refreshHealth, HealthState } from "../../redux/health";
+
+import { AdminUIState } from "../../redux/state";
+import { refreshHealth, HealthState } from "../../redux/apiReducers";
 
 class DisconnectedBannerProps {
   health: HealthState;
@@ -35,11 +37,11 @@ class DisconnectedBanner extends React.Component<DisconnectedBannerProps, Discon
   }
 }
 
-let health = (state: any): HealthState => state && state.health && state.health;
+let health = (state: AdminUIState): HealthState => state.cachedData.health;
 
 // Connect the DisconnectedBanner class with our redux store.
 let disconnectedBannerConnected = connect(
-  (state, ownProps) => {
+  (state: AdminUIState) => {
     return {
       health: health(state),
     };

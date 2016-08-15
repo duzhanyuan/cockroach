@@ -63,13 +63,15 @@ const (
 	AdminSplit
 	// AdminMerge is called to coordinate a merge of two adjacent ranges.
 	AdminMerge
+	// AdminTransferLease is called to initiate a range lease transfer.
+	AdminTransferLease
 	// HeartbeatTxn sends a periodic heartbeat to extant
 	// transaction rows to indicate the client is still alive and
 	// the transaction should not be considered abandoned.
 	HeartbeatTxn
 	// GC garbage collects values based on expired timestamps
 	// for a list of keys in a range. This method is called by the
-	// range leader after a snapshot scan. The call goes through Raft,
+	// range lease holder after a snapshot scan. The call goes through Raft,
 	// so all range replicas GC the exact same values.
 	GC
 	// PushTxn attempts to resolve read or write conflicts between
@@ -101,8 +103,10 @@ const (
 	Merge
 	// TruncateLog discards a prefix of the raft log.
 	TruncateLog
-	// LeaderLease requests a leader lease for a replica.
-	LeaderLease
+	// RequestLease requests a range lease for a replica.
+	RequestLease
+	// TransferLease transfers the range lease from a lease holder to a new one.
+	TransferLease
 	// ComputeChecksum starts a checksum computation over a replica snapshot.
 	ComputeChecksum
 	// VerifyChecksum verifies the checksum computed through an earlier

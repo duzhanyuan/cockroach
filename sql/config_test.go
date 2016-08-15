@@ -17,17 +17,21 @@
 package sql_test
 
 import (
-	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/config"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/protoutil"
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
 
@@ -37,7 +41,7 @@ var configDescKey = sqlbase.MakeDescMetadataKey(keys.MaxReservedDescID)
 // forceNewConfig forces a system config update by writing a bogus descriptor with an
 // incremented value inside. It then repeatedly fetches the gossip config until the
 // just-written descriptor is found.
-func forceNewConfig(t *testing.T, s *testServer) config.SystemConfig {
+func forceNewConfig(t *testing.T, s *server.TestServer) config.SystemConfig {
 	configID++
 	configDesc := &sqlbase.Descriptor{
 		Union: &sqlbase.Descriptor_Database{
@@ -50,7 +54,7 @@ func forceNewConfig(t *testing.T, s *testServer) config.SystemConfig {
 	}
 
 	// This needs to be done in a transaction with the system trigger set.
-	if err := s.DB().Txn(func(txn *client.Txn) error {
+	if err := s.DB().Txn(context.TODO(), func(txn *client.Txn) error {
 		txn.SetSystemConfigTrigger()
 		return txn.Put(configDescKey, configDesc)
 	}); err != nil {
@@ -59,7 +63,7 @@ func forceNewConfig(t *testing.T, s *testServer) config.SystemConfig {
 	return waitForConfigChange(t, s)
 }
 
-func waitForConfigChange(t *testing.T, s *testServer) config.SystemConfig {
+func waitForConfigChange(t *testing.T, s *server.TestServer) config.SystemConfig {
 	var foundDesc sqlbase.Descriptor
 	var cfg config.SystemConfig
 	util.SucceedsSoon(t, func() error {
@@ -83,11 +87,10 @@ func waitForConfigChange(t *testing.T, s *testServer) config.SystemConfig {
 // TestGetZoneConfig exercises config.GetZoneConfig and the sql hook for it.
 func TestGetZoneConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// Disable splitting. We're using bad attributes in zone configs
-	// to be able to match.
-	defer config.TestingDisableTableSplits()()
-	s, sqlDB, _ := setup(t)
-	defer cleanup(s, sqlDB)
+	params, _ := createTestServerParams()
+	srv, sqlDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop()
+	s := srv.(*server.TestServer)
 
 	expectedCounter := uint32(keys.MaxReservedDescID + 1)
 
@@ -147,33 +150,35 @@ func TestGetZoneConfig(t *testing.T) {
 	}
 	expectedCounter++
 
-	cfg := forceNewConfig(t, s)
+	{
+		cfg := forceNewConfig(t, s)
 
-	// We have no custom zone configs.
-	testCases := []struct {
-		key     roachpb.RKey
-		zoneCfg *config.ZoneConfig
-	}{
-		{roachpb.RKeyMin, &defaultZoneConfig},
-		{keys.MakeTablePrefix(0), &defaultZoneConfig},
-		{keys.MakeTablePrefix(1), &defaultZoneConfig},
-		{keys.MakeTablePrefix(keys.MaxReservedDescID), &defaultZoneConfig},
-		{keys.MakeTablePrefix(db1), &defaultZoneConfig},
-		{keys.MakeTablePrefix(db2), &defaultZoneConfig},
-		{keys.MakeTablePrefix(tb11), &defaultZoneConfig},
-		{keys.MakeTablePrefix(tb12), &defaultZoneConfig},
-		{keys.MakeTablePrefix(tb21), &defaultZoneConfig},
-		{keys.MakeTablePrefix(tb22), &defaultZoneConfig},
-	}
-
-	for tcNum, tc := range testCases {
-		zoneCfg, err := cfg.GetZoneConfigForKey(tc.key)
-		if err != nil {
-			t.Fatalf("#%d: err=%s", tcNum, err)
+		// We have no custom zone configs.
+		testCases := []struct {
+			key     roachpb.RKey
+			zoneCfg config.ZoneConfig
+		}{
+			{roachpb.RKeyMin, defaultZoneConfig},
+			{keys.MakeTablePrefix(0), defaultZoneConfig},
+			{keys.MakeTablePrefix(1), defaultZoneConfig},
+			{keys.MakeTablePrefix(keys.MaxReservedDescID), defaultZoneConfig},
+			{keys.MakeTablePrefix(db1), defaultZoneConfig},
+			{keys.MakeTablePrefix(db2), defaultZoneConfig},
+			{keys.MakeTablePrefix(tb11), defaultZoneConfig},
+			{keys.MakeTablePrefix(tb12), defaultZoneConfig},
+			{keys.MakeTablePrefix(tb21), defaultZoneConfig},
+			{keys.MakeTablePrefix(tb22), defaultZoneConfig},
 		}
 
-		if !reflect.DeepEqual(zoneCfg, tc.zoneCfg) {
-			t.Errorf("#%d: bad zone config.\nexpected: %+v\ngot: %+v", tcNum, tc.zoneCfg, zoneCfg)
+		for tcNum, tc := range testCases {
+			zoneCfg, err := cfg.GetZoneConfigForKey(tc.key)
+			if err != nil {
+				t.Fatalf("#%d: err=%s", tcNum, err)
+			}
+
+			if !proto.Equal(&zoneCfg, &tc.zoneCfg) {
+				t.Errorf("#%d: bad zone config.\nexpected: %+v\ngot: %+v", tcNum, tc.zoneCfg, zoneCfg)
+			}
 		}
 	}
 
@@ -209,32 +214,34 @@ func TestGetZoneConfig(t *testing.T) {
 		}
 	}
 
-	cfg = forceNewConfig(t, s)
+	{
+		cfg := forceNewConfig(t, s)
 
-	testCases = []struct {
-		key     roachpb.RKey
-		zoneCfg *config.ZoneConfig
-	}{
-		{roachpb.RKeyMin, &defaultZoneConfig},
-		{keys.MakeTablePrefix(0), &defaultZoneConfig},
-		{keys.MakeTablePrefix(1), &defaultZoneConfig},
-		{keys.MakeTablePrefix(keys.MaxReservedDescID), &defaultZoneConfig},
-		{keys.MakeTablePrefix(db1), &db1Cfg},
-		{keys.MakeTablePrefix(db2), &defaultZoneConfig},
-		{keys.MakeTablePrefix(tb11), &tb11Cfg},
-		{keys.MakeTablePrefix(tb12), &db1Cfg},
-		{keys.MakeTablePrefix(tb21), &tb21Cfg},
-		{keys.MakeTablePrefix(tb22), &defaultZoneConfig},
-	}
-
-	for tcNum, tc := range testCases {
-		zoneCfg, err := cfg.GetZoneConfigForKey(tc.key)
-		if err != nil {
-			t.Fatalf("#%d: err=%s", tcNum, err)
+		testCases := []struct {
+			key     roachpb.RKey
+			zoneCfg config.ZoneConfig
+		}{
+			{roachpb.RKeyMin, defaultZoneConfig},
+			{keys.MakeTablePrefix(0), defaultZoneConfig},
+			{keys.MakeTablePrefix(1), defaultZoneConfig},
+			{keys.MakeTablePrefix(keys.MaxReservedDescID), defaultZoneConfig},
+			{keys.MakeTablePrefix(db1), db1Cfg},
+			{keys.MakeTablePrefix(db2), defaultZoneConfig},
+			{keys.MakeTablePrefix(tb11), tb11Cfg},
+			{keys.MakeTablePrefix(tb12), db1Cfg},
+			{keys.MakeTablePrefix(tb21), tb21Cfg},
+			{keys.MakeTablePrefix(tb22), defaultZoneConfig},
 		}
 
-		if !reflect.DeepEqual(zoneCfg, tc.zoneCfg) {
-			t.Errorf("#%d: bad zone config.\nexpected: %+v\ngot: %+v", tcNum, tc.zoneCfg, zoneCfg)
+		for tcNum, tc := range testCases {
+			zoneCfg, err := cfg.GetZoneConfigForKey(tc.key)
+			if err != nil {
+				t.Fatalf("#%d: err=%s", tcNum, err)
+			}
+
+			if !proto.Equal(&zoneCfg, &tc.zoneCfg) {
+				t.Errorf("#%d: bad zone config.\nexpected: %+v\ngot: %+v", tcNum, tc.zoneCfg, zoneCfg)
+			}
 		}
 	}
 }

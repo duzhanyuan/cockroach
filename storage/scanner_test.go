@@ -18,9 +18,10 @@ package storage
 
 import (
 	"fmt"
-	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/google/btree"
 	"github.com/pkg/errors"
@@ -32,19 +33,20 @@ import (
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // Test implementation of a range set backed by btree.BTree.
 type testRangeSet struct {
-	sync.Mutex
-	rangesByKey *btree.BTree
-	visited     int
+	syncutil.Mutex
+	replicasByKey *btree.BTree
+	visited       int
 }
 
 // newTestRangeSet creates a new range set that has the count number of ranges.
 func newTestRangeSet(count int, t *testing.T) *testRangeSet {
-	rs := &testRangeSet{rangesByKey: btree.New(64 /* degree */)}
+	rs := &testRangeSet{replicasByKey: btree.New(64 /* degree */)}
 	for i := 0; i < count; i++ {
 		desc := &roachpb.RangeDescriptor{
 			RangeID:  roachpb.RangeID(i),
@@ -65,7 +67,7 @@ func newTestRangeSet(count int, t *testing.T) *testRangeSet {
 		if err := rng.setDesc(desc); err != nil {
 			t.Fatal(err)
 		}
-		if exRngItem := rs.rangesByKey.ReplaceOrInsert(rng); exRngItem != nil {
+		if exRngItem := rs.replicasByKey.ReplaceOrInsert(rng); exRngItem != nil {
 			t.Fatalf("failed to insert range %s", rng)
 		}
 	}
@@ -76,7 +78,7 @@ func (rs *testRangeSet) Visit(visitor func(*Replica) bool) {
 	rs.Lock()
 	defer rs.Unlock()
 	rs.visited = 0
-	rs.rangesByKey.Ascend(func(i btree.Item) bool {
+	rs.replicasByKey.Ascend(func(i btree.Item) bool {
 		rs.visited++
 		rs.Unlock()
 		defer rs.Lock()
@@ -87,7 +89,7 @@ func (rs *testRangeSet) Visit(visitor func(*Replica) bool) {
 func (rs *testRangeSet) EstimatedCount() int {
 	rs.Lock()
 	defer rs.Unlock()
-	count := rs.rangesByKey.Len() - rs.visited
+	count := rs.replicasByKey.Len() - rs.visited
 	if count < 1 {
 		count = 1
 	}
@@ -99,7 +101,7 @@ func (rs *testRangeSet) remove(index int, t *testing.T) *Replica {
 	endKey := roachpb.Key(fmt.Sprintf("%03d", index+1))
 	rs.Lock()
 	defer rs.Unlock()
-	rng := rs.rangesByKey.Delete((rangeBTreeKey)(endKey))
+	rng := rs.replicasByKey.Delete((rangeBTreeKey)(endKey))
 	if rng == nil {
 		t.Fatalf("failed to delete range of end key %s", endKey)
 	}
@@ -109,11 +111,11 @@ func (rs *testRangeSet) remove(index int, t *testing.T) *Replica {
 // Test implementation of a range queue which adds range to an
 // internal slice.
 type testQueue struct {
-	sync.Mutex // Protects ranges, done & processed count
-	ranges     []*Replica
-	done       bool
-	processed  int
-	disabled   bool
+	syncutil.Mutex // Protects ranges, done & processed count
+	ranges         []*Replica
+	done           bool
+	processed      int
+	disabled       bool
 }
 
 // setDisabled suspends processing of items from the queue.
@@ -253,7 +255,7 @@ func TestScannerTiming(t *testing.T) {
 			stopper.Stop()
 
 			avg := s.avgScan()
-			log.Infof("%d: average scan: %s", i, avg)
+			log.Infof(context.Background(), "%d: average scan: %s", i, avg)
 			if avg.Nanoseconds()-duration.Nanoseconds() > maxError.Nanoseconds() ||
 				duration.Nanoseconds()-avg.Nanoseconds() > maxError.Nanoseconds() {
 				return errors.Errorf("expected %s, got %s: exceeds max error of %s", duration, avg, maxError)

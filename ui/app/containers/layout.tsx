@@ -1,6 +1,6 @@
 import * as React from "react";
 import _ = require("lodash");
-import { RouteComponentProps } from "react-router";
+import { IInjectedProps } from "react-router";
 
 import { TitledComponent } from "../interfaces/layout";
 import SideBar from "../components/layoutSidebar";
@@ -8,8 +8,8 @@ import Header from "../components/layoutHeader";
 import TimeWindowManager from "../containers/timewindow";
 import Banner from "../containers/banner/bannerContainer";
 
-function isTitledComponent(obj: any): obj is TitledComponent {
-  return obj && _.isFunction(obj.title);
+function isTitledComponent(obj: Object | TitledComponent): obj is TitledComponent {
+  return obj && _.isFunction((obj as TitledComponent).title);
 }
 
 /**
@@ -18,18 +18,21 @@ function isTitledComponent(obj: any): obj is TitledComponent {
  *
  * Individual pages provide their content via react-router.
  */
-export default class extends React.Component<RouteComponentProps<any, any>, {}> {
+export default class extends React.Component<IInjectedProps, {}> {
   render() {
     // Responsibility for rendering a title is decided based on the route;
     // specifically, the most specific current route for which that route's
     // component implements a "title" method.
     let { routes, children } = this.props;
-    let titleIndex = _.findLastIndex(routes, (r) => isTitledComponent(r.component));
+    let title: React.ReactElement<any>;
 
-    // We already know from findLastIndex that routes[titleIndex].component is
-    // of type TitledComponent.
-    let titleComponent = (titleIndex !== -1) ? (routes[titleIndex].component as any as TitledComponent) : null;
-    let title = titleComponent ? titleComponent.title(this.props) : "";
+    for (let i = routes.length - 1; i >= 0; i--) {
+      let component: Object | TitledComponent = routes[i].component;
+      if (isTitledComponent(component)) {
+        title = component.title(this.props);
+        break;
+      }
+    }
 
     return <div>
       <Banner />

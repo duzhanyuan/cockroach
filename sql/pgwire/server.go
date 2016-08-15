@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/base"
@@ -29,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/pkg/errors"
 )
 
@@ -40,6 +40,13 @@ const (
 	// ErrDraining is returned when a client attempts to connect to a server
 	// which is not accepting client connections.
 	ErrDraining = "server is not accepting clients"
+)
+
+// Fully-qualified names for metrics.
+var (
+	MetaConns    = metric.Metadata{Name: "sql.conns"}
+	MetaBytesIn  = metric.Metadata{Name: "sql.bytesin"}
+	MetaBytesOut = metric.Metadata{Name: "sql.bytesout"}
 )
 
 const (
@@ -63,23 +70,25 @@ type Server struct {
 	metrics  *serverMetrics
 
 	mu struct {
-		sync.Mutex
+		syncutil.Mutex
 		draining bool
 	}
 }
 
 type serverMetrics struct {
-	bytesInCount  *metric.Counter
-	bytesOutCount *metric.Counter
-	conns         *metric.Counter
+	BytesInCount  *metric.Counter
+	BytesOutCount *metric.Counter
+	Conns         *metric.Counter
 }
 
 func newServerMetrics(reg *metric.Registry) *serverMetrics {
-	return &serverMetrics{
-		conns:         reg.Counter("conns"),
-		bytesInCount:  reg.Counter("bytesin"),
-		bytesOutCount: reg.Counter("bytesout"),
+	sm := &serverMetrics{
+		Conns:         metric.NewCounter(MetaConns),
+		BytesInCount:  metric.NewCounter(MetaBytesIn),
+		BytesOutCount: metric.NewCounter(MetaBytesOut),
 	}
+	reg.AddMetricStruct(sm)
+	return sm
 }
 
 // MakeServer creates a Server, adding network stats to the given Registry.
@@ -128,7 +137,7 @@ func (s *Server) SetDraining(drain bool) error {
 		return nil
 	}
 	return util.RetryForDuration(drainMaxWait, func() error {
-		if c := s.metrics.conns.Count(); c != 0 {
+		if c := s.metrics.Conns.Count(); c != 0 {
 			// TODO(tschottdorf): Do more plumbing to actively disrupt
 			// connections; see #6283. There isn't much of a point until
 			// we know what load-balanced clients like to see (#6295).
@@ -153,8 +162,8 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	// DrainClient() waits for that number to drop to zero,
 	// so we don't want it to oscillate unnecessarily.
 	if !draining {
-		s.metrics.conns.Inc(1)
-		defer s.metrics.conns.Dec(1)
+		s.metrics.Conns.Inc(1)
+		defer s.metrics.Conns.Dec(1)
 	}
 
 	var buf readBuffer
@@ -162,7 +171,7 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
-	s.metrics.bytesInCount.Inc(int64(n))
+	s.metrics.BytesInCount.Inc(int64(n))
 	version, err := buf.getUint32()
 	if err != nil {
 		return err
@@ -192,7 +201,7 @@ func (s *Server) ServeConn(conn net.Conn) error {
 		if err != nil {
 			return err
 		}
-		s.metrics.bytesInCount.Inc(int64(n))
+		s.metrics.BytesInCount.Inc(int64(n))
 		version, err = buf.getUint32()
 		if err != nil {
 			return err

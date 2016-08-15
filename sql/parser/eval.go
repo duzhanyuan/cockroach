@@ -26,6 +26,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/net/context"
+
 	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -247,6 +249,32 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			},
 		},
 		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeInt,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Dec
+				r := *right.(*DInt)
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(r))
+				dd.Add(l, &dd.Dec)
+				return dd, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeInt,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := *left.(*DInt)
+				r := &right.(*DDecimal).Dec
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(l))
+				dd.Add(&dd.Dec, r)
+				return dd, nil
+			},
+		},
+		BinOp{
 			LeftType:   TypeDate,
 			RightType:  TypeInt,
 			ReturnType: TypeDate,
@@ -336,6 +364,32 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			},
 		},
 		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeInt,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Dec
+				r := *right.(*DInt)
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(r))
+				dd.Sub(l, &dd.Dec)
+				return dd, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeInt,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := *left.(*DInt)
+				r := &right.(*DDecimal).Dec
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(l))
+				dd.Sub(&dd.Dec, r)
+				return dd, nil
+			},
+		},
+		BinOp{
 			LeftType:   TypeDate,
 			RightType:  TypeInt,
 			ReturnType: TypeDate,
@@ -413,6 +467,18 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return NewDFloat(*left.(*DFloat) * *right.(*DFloat)), nil
 			},
 		},
+		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Dec
+				r := &right.(*DDecimal).Dec
+				dd := &DDecimal{}
+				dd.Mul(l, r)
+				return dd, nil
+			},
+		},
 		// The following two overloads are needed becauase DInt/DInt = DDecimal. Due to this
 		// operation, normalization may sometimes create a DInt * DDecimal operation.
 		BinOp{
@@ -424,7 +490,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				r := *right.(*DInt)
 				dd := &DDecimal{}
 				dd.SetUnscaled(int64(r))
-				dd.Mul(&dd.Dec, l)
+				dd.Mul(l, &dd.Dec)
 				return dd, nil
 			},
 		},
@@ -438,18 +504,6 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				dd := &DDecimal{}
 				dd.SetUnscaled(int64(l))
 				dd.Mul(&dd.Dec, r)
-				return dd, nil
-			},
-		},
-		BinOp{
-			LeftType:   TypeDecimal,
-			RightType:  TypeDecimal,
-			ReturnType: TypeDecimal,
-			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				l := &left.(*DDecimal).Dec
-				r := &right.(*DDecimal).Dec
-				dd := &DDecimal{}
-				dd.Mul(l, r)
 				return dd, nil
 			},
 		},
@@ -512,6 +566,38 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			},
 		},
 		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeInt,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Dec
+				r := *right.(*DInt)
+				if r == 0 {
+					return nil, errDivByZero
+				}
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(r))
+				dd.QuoRound(l, &dd.Dec, decimal.Precision, inf.RoundHalfUp)
+				return dd, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeInt,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := *left.(*DInt)
+				r := &right.(*DDecimal).Dec
+				if r.Sign() == 0 {
+					return nil, errDivByZero
+				}
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(l))
+				dd.QuoRound(&dd.Dec, r, decimal.Precision, inf.RoundHalfUp)
+				return dd, nil
+			},
+		},
+		BinOp{
 			LeftType:   TypeInterval,
 			RightType:  TypeInt,
 			ReturnType: TypeInterval,
@@ -563,6 +649,38 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				return dd, nil
 			},
 		},
+		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeInt,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Dec
+				r := *right.(*DInt)
+				if r == 0 {
+					return nil, errDivByZero
+				}
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(r))
+				dd.QuoRound(l, &dd.Dec, 0, inf.RoundDown)
+				return dd, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeInt,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := *left.(*DInt)
+				r := &right.(*DDecimal).Dec
+				if r.Sign() == 0 {
+					return nil, errDivByZero
+				}
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(l))
+				dd.QuoRound(&dd.Dec, r, 0, inf.RoundDown)
+				return dd, nil
+			},
+		},
 	},
 
 	Mod: {
@@ -598,6 +716,38 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				}
 				dd := &DDecimal{}
 				decimal.Mod(&dd.Dec, l, r)
+				return dd, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeInt,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Dec
+				r := *right.(*DInt)
+				if r == 0 {
+					return nil, errZeroModulus
+				}
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(r))
+				decimal.Mod(&dd.Dec, l, &dd.Dec)
+				return dd, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeInt,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := *left.(*DInt)
+				r := &right.(*DDecimal).Dec
+				if r.Sign() == 0 {
+					return nil, errZeroModulus
+				}
+				dd := &DDecimal{}
+				dd.SetUnscaled(int64(l))
+				decimal.Mod(&dd.Dec, &dd.Dec, r)
 				return dd, nil
 			},
 		},
@@ -795,7 +945,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 			LeftType:  TypeDate,
 			RightType: TypeDate,
 			fn: func(_ *EvalContext, left Datum, right Datum) (DBool, error) {
-				return DBool(left.(*DDate) == right.(*DDate)), nil
+				return DBool(*left.(*DDate) == *right.(*DDate)), nil
 			},
 		},
 		CmpOp{
@@ -848,7 +998,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 			LeftType:  TypeBool,
 			RightType: TypeBool,
 			fn: func(_ *EvalContext, left Datum, right Datum) (DBool, error) {
-				return DBool(!*left.(*DBool) && *right.(*DBool)), nil
+				return !*left.(*DBool) && *right.(*DBool), nil
 			},
 		},
 		CmpOp{
@@ -981,7 +1131,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 			LeftType:  TypeBool,
 			RightType: TypeBool,
 			fn: func(_ *EvalContext, left Datum, right Datum) (DBool, error) {
-				return DBool(!*left.(*DBool) || *right.(*DBool)), nil
+				return !*left.(*DBool) || *right.(*DBool), nil
 			},
 		},
 		CmpOp{
@@ -1114,17 +1264,17 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 			LeftType:  TypeString,
 			RightType: TypeString,
 			fn: func(ctx *EvalContext, left Datum, right Datum) (DBool, error) {
-				pattern := string(*right.(*DString))
-				like := optimizedLikeFunc(pattern)
-				if like == nil {
-					key := likeKey(pattern)
-					re, err := ctx.ReCache.GetRegexp(key)
-					if err != nil {
-						return DBool(false), fmt.Errorf("LIKE regexp compilation failed: %v", err)
-					}
-					like = re.MatchString
-				}
-				return DBool(like(string(*left.(*DString)))), nil
+				return matchLike(ctx, left, right, false)
+			},
+		},
+	},
+
+	ILike: {
+		CmpOp{
+			LeftType:  TypeString,
+			RightType: TypeString,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (DBool, error) {
+				return matchLike(ctx, left, right, true)
 			},
 		},
 	},
@@ -1135,11 +1285,29 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 			RightType: TypeString,
 			fn: func(ctx *EvalContext, left Datum, right Datum) (DBool, error) {
 				key := similarToKey(*right.(*DString))
-				re, err := ctx.ReCache.GetRegexp(key)
-				if err != nil {
-					return DBool(false), err
-				}
-				return DBool(re.MatchString(string(*left.(*DString)))), nil
+				return matchRegexpWithKey(ctx, left, key)
+			},
+		},
+	},
+
+	RegMatch: {
+		CmpOp{
+			LeftType:  TypeString,
+			RightType: TypeString,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (DBool, error) {
+				key := regexpKey{s: string(*right.(*DString)), caseInsensitive: false}
+				return matchRegexpWithKey(ctx, left, key)
+			},
+		},
+	},
+
+	RegIMatch: {
+		CmpOp{
+			LeftType:  TypeString,
+			RightType: TypeString,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (DBool, error) {
+				key := regexpKey{s: string(*right.(*DString)), caseInsensitive: true}
+				return matchRegexpWithKey(ctx, left, key)
 			},
 		},
 	},
@@ -1178,6 +1346,28 @@ func makeEvalTupleIn(d Datum) CmpOp {
 			return DBool(found), nil
 		},
 	}
+}
+
+func matchLike(ctx *EvalContext, left, right Datum, caseInsensitive bool) (DBool, error) {
+	pattern := string(*right.(*DString))
+	like := optimizedLikeFunc(pattern, caseInsensitive)
+	if like == nil {
+		key := likeKey{s: pattern, caseInsensitive: caseInsensitive}
+		re, err := ctx.ReCache.GetRegexp(key)
+		if err != nil {
+			return DBool(false), fmt.Errorf("LIKE regexp compilation failed: %v", err)
+		}
+		like = re.MatchString
+	}
+	return DBool(like(string(*left.(*DString)))), nil
+}
+
+func matchRegexpWithKey(ctx *EvalContext, str Datum, key regexpCacheKey) (DBool, error) {
+	re, err := ctx.ReCache.GetRegexp(key)
+	if err != nil {
+		return DBool(false), err
+	}
+	return DBool(re.MatchString(string(*str.(*DString)))), nil
 }
 
 // EvalContext defines the context in which to evaluate an expression, allowing
@@ -1558,6 +1748,11 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
+func (expr *AnnotateTypeExpr) Eval(ctx *EvalContext) (Datum, error) {
+	return expr.Expr.(TypedExpr).Eval(ctx)
+}
+
+// Eval implements the TypedExpr interface.
 func (expr *CoalesceExpr) Eval(ctx *EvalContext) (Datum, error) {
 	for _, e := range expr.Exprs {
 		d, err := e.(TypedExpr).Eval(ctx)
@@ -1820,14 +2015,14 @@ func (expr *ParenExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 // Eval implements the TypedExpr interface.
 func (expr *RangeCond) Eval(_ *EvalContext) (Datum, error) {
-	log.Errorf("unhandled type %T passed to Eval", expr)
+	log.Errorf(context.TODO(), "unhandled type %T passed to Eval", expr)
 	return nil, errors.Errorf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
 func (expr *Subquery) Eval(_ *EvalContext) (Datum, error) {
 	// Subquery expressions are handled during subquery expansion.
-	log.Errorf("unhandled type %T passed to Eval", expr)
+	log.Errorf(context.TODO(), "unhandled type %T passed to Eval", expr)
 	return nil, errors.Errorf("unhandled type %T", expr)
 }
 
@@ -1845,13 +2040,31 @@ func (expr *UnaryExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 // Eval implements the TypedExpr interface.
 func (expr DefaultVal) Eval(_ *EvalContext) (Datum, error) {
-	log.Errorf("unhandled type %T passed to Eval", expr)
+	log.Errorf(context.TODO(), "unhandled type %T passed to Eval", expr)
 	return nil, errors.Errorf("unhandled type %T", expr)
 }
 
 // Eval implements the TypedExpr interface.
-func (expr *QualifiedName) Eval(ctx *EvalContext) (Datum, error) {
-	log.Errorf("unhandled type %T passed to Eval", expr)
+func (expr UnqualifiedStar) Eval(ctx *EvalContext) (Datum, error) {
+	log.Errorf(context.TODO(), "unhandled type %T passed to Eval", expr)
+	return nil, errors.Errorf("unhandled type %T", expr)
+}
+
+// Eval implements the TypedExpr interface.
+func (expr UnresolvedName) Eval(ctx *EvalContext) (Datum, error) {
+	log.Errorf(context.TODO(), "unhandled type %T passed to Eval", expr)
+	return nil, errors.Errorf("unhandled type %T", expr)
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *AllColumnsSelector) Eval(ctx *EvalContext) (Datum, error) {
+	log.Errorf(context.TODO(), "unhandled type %T passed to Eval", expr)
+	return nil, errors.Errorf("unhandled type %T", expr)
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *ColumnItem) Eval(ctx *EvalContext) (Datum, error) {
+	log.Errorf(context.TODO(), "unhandled type %T passed to Eval", expr)
 	return nil, errors.Errorf("unhandled type %T", expr)
 }
 
@@ -1970,9 +2183,18 @@ func foldComparisonExpr(
 	case NotLike:
 		// NotLike(left, right) is implemented as !Like(left, right)
 		return Like, left, right, false, true
+	case NotILike:
+		// NotILike(left, right) is implemented as !ILike(left, right)
+		return ILike, left, right, false, true
 	case NotSimilarTo:
 		// NotSimilarTo(left, right) is implemented as !SimilarTo(left, right)
 		return SimilarTo, left, right, false, true
+	case NotRegMatch:
+		// NotRegMatch(left, right) is implemented as !RegMatch(left, right)
+		return RegMatch, left, right, false, true
+	case NotRegIMatch:
+		// NotRegIMatch(left, right) is implemented as !RegIMatch(left, right)
+		return RegIMatch, left, right, false, true
 	case IsDistinctFrom:
 		// IsDistinctFrom(left, right) is implemented as !EQ(left, right)
 		//
@@ -2001,10 +2223,10 @@ func foldComparisonExpr(
 	return op, left, right, false, false
 }
 
-// Simplifies LIKE expressions that do not need full regular expressions to evaluate the condition.
-// For example, when the expression is just checking to see if a string starts with a given
-// pattern.
-func optimizedLikeFunc(pattern string) func(string) bool {
+// Simplifies LIKE/ILIKE expressions that do not need full regular expressions to
+// evaluate the condition. For example, when the expression is just checking to see
+// if a string starts with a given pattern.
+func optimizedLikeFunc(pattern string, caseInsensitive bool) func(string) bool {
 	switch len(pattern) {
 	case 0:
 		return func(s string) bool {
@@ -2029,15 +2251,27 @@ func optimizedLikeFunc(pattern string) func(string) bool {
 			switch {
 			case anyEnd && anyStart:
 				return func(s string) bool {
-					return strings.Contains(s, pattern[1:len(pattern)-1])
+					substr := pattern[1 : len(pattern)-1]
+					if caseInsensitive {
+						s, substr = strings.ToUpper(s), strings.ToUpper(substr)
+					}
+					return strings.Contains(s, substr)
 				}
 			case anyEnd:
 				return func(s string) bool {
-					return strings.HasPrefix(s, pattern[:len(pattern)-1])
+					prefix := pattern[:len(pattern)-1]
+					if caseInsensitive {
+						s, prefix = strings.ToUpper(s), strings.ToUpper(prefix)
+					}
+					return strings.HasPrefix(s, prefix)
 				}
 			case anyStart:
 				return func(s string) bool {
-					return strings.HasSuffix(s, pattern[1:])
+					suffix := pattern[1:]
+					if caseInsensitive {
+						s, suffix = strings.ToUpper(s), strings.ToUpper(suffix)
+					}
+					return strings.HasSuffix(s, suffix)
 				}
 			}
 		}
@@ -2045,14 +2279,17 @@ func optimizedLikeFunc(pattern string) func(string) bool {
 	return nil
 }
 
-type likeKey string
+type likeKey struct {
+	s               string
+	caseInsensitive bool
+}
 
 func (k likeKey) pattern() (string, error) {
-	pattern := regexp.QuoteMeta(string(k))
-	// Replace LIKE specific wildcards with standard wildcards
+	pattern := regexp.QuoteMeta(k.s)
+	// Replace LIKE/ILIKE specific wildcards with standard wildcards
 	pattern = strings.Replace(pattern, "%", ".*", -1)
 	pattern = strings.Replace(pattern, "_", ".", -1)
-	return anchorPattern(pattern, false), nil
+	return anchorPattern(pattern, k.caseInsensitive), nil
 }
 
 type similarToKey string
@@ -2060,6 +2297,18 @@ type similarToKey string
 func (k similarToKey) pattern() (string, error) {
 	pattern := SimilarEscape(string(k))
 	return anchorPattern(pattern, false), nil
+}
+
+type regexpKey struct {
+	s               string
+	caseInsensitive bool
+}
+
+func (k regexpKey) pattern() (string, error) {
+	if k.caseInsensitive {
+		return caseInsensitive(k.s), nil
+	}
+	return k.s, nil
 }
 
 // SimilarEscape converts a SQL:2008 regexp pattern to POSIX style, so it can
@@ -2123,6 +2372,15 @@ func similarEscapeCustomChar(pattern string, escapeChar rune) string {
 	}
 
 	return string(patternBuilder)
+}
+
+// caseInsensitive surrounds the transformed input string with
+//   (?i: ... )
+// which uses a non-capturing set of parens to turn a case sensitive
+// regular expression pattern into a case insensitive regular
+// expression pattern.
+func caseInsensitive(pattern string) string {
+	return fmt.Sprintf("(?i:%s)", pattern)
 }
 
 // anchorPattern surrounds the transformed input string with

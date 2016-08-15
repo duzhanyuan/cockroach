@@ -44,14 +44,16 @@ type Expr interface {
 // TypedExpr represents a well-typed expression.
 type TypedExpr interface {
 	Expr
-	// Eval evaluates an SQL expression. Expression evaluation is a mostly
-	// straightforward walk over the parse tree. The only significant complexity is
-	// the handling of types and implicit conversions. See binOps and cmpOps for
-	// more details. Note that expression evaluation returns an error if certain
-	// node types are encountered: Placeholder, QualifiedName or Subquery. These nodes
-	// should be replaced prior to expression evaluation by an appropriate
-	// WalkExpr. For example, Placeholder should be replace by the argument passed from
-	// the client.
+	// Eval evaluates an SQL expression. Expression evaluation is a
+	// mostly straightforward walk over the parse tree. The only
+	// significant complexity is the handling of types and implicit
+	// conversions. See binOps and cmpOps for more details. Note that
+	// expression evaluation returns an error if certain node types are
+	// encountered: Placeholder, VarName (and related UnqualifiedStar,
+	// UnresolvedName and AllColumnsSelector) or Subquery. These nodes
+	// should be replaced prior to expression evaluation by an
+	// appropriate WalkExpr. For example, Placeholder should be replace
+	// by the argument passed from the client.
 	Eval(*EvalContext) (Datum, error)
 	// ReturnType provides the type of the TypedExpr, which is the type of Datum that
 	// the TypedExpr will return when evaluated.
@@ -257,8 +259,14 @@ const (
 	NotIn
 	Like
 	NotLike
+	ILike
+	NotILike
 	SimilarTo
 	NotSimilarTo
+	RegMatch
+	NotRegMatch
+	RegIMatch
+	NotRegIMatch
 	IsDistinctFrom
 	IsNotDistinctFrom
 	Is
@@ -276,8 +284,14 @@ var comparisonOpName = [...]string{
 	NotIn:             "NOT IN",
 	Like:              "LIKE",
 	NotLike:           "NOT LIKE",
+	ILike:             "ILIKE",
+	NotILike:          "NOT ILIKE",
 	SimilarTo:         "SIMILAR TO",
 	NotSimilarTo:      "NOT SIMILAR TO",
+	RegMatch:          "~",
+	NotRegMatch:       "!~",
+	RegIMatch:         "~*",
+	NotRegIMatch:      "!~*",
 	IsDistinctFrom:    "IS DISTINCT FROM",
 	IsNotDistinctFrom: "IS NOT DISTINCT FROM",
 	Is:                "IS",
@@ -456,6 +470,21 @@ type IfExpr struct {
 	typeAnnotation
 }
 
+// TypedTrueExpr returns the IfExpr's True expression as a TypedExpr.
+func (node *IfExpr) TypedTrueExpr() TypedExpr {
+	return node.True.(TypedExpr)
+}
+
+// TypedCondExpr returns the IfExpr's Cond expression as a TypedExpr.
+func (node *IfExpr) TypedCondExpr() TypedExpr {
+	return node.Cond.(TypedExpr)
+}
+
+// TypedElseExpr returns the IfExpr's Else expression as a TypedExpr.
+func (node *IfExpr) TypedElseExpr() TypedExpr {
+	return node.Else.(TypedExpr)
+}
+
 // Format implements the NodeFormatter interface.
 func (node *IfExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("IF(")
@@ -492,6 +521,11 @@ type CoalesceExpr struct {
 	typeAnnotation
 }
 
+// TypedExprAt returns the expression at the specified index as a TypedExpr.
+func (node *CoalesceExpr) TypedExprAt(idx int) TypedExpr {
+	return node.Exprs[idx].(TypedExpr)
+}
+
 // Format implements the NodeFormatter interface.
 func (node *CoalesceExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(node.Name)
@@ -525,293 +559,6 @@ func (Placeholder) Variable() {}
 func (node Placeholder) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteByte('$')
 	buf.WriteString(node.Name)
-}
-
-type nameType int
-
-const (
-	_ nameType = iota
-	tableName
-	columnName
-)
-
-var _ VariableExpr = &QualifiedName{}
-
-// QualifiedName is a base name and an optional indirection expression.
-type QualifiedName struct {
-	Base       Name
-	Indirect   Indirection
-	normalized nameType
-
-	// We preserve the "original" string representation (before normalization).
-	origString string
-}
-
-// ReturnType implements the TypedExpr interface.
-func (node *QualifiedName) ReturnType() Datum {
-	if qualifiedNameTypes == nil {
-		return nil
-	}
-	return qualifiedNameTypes[node.String()]
-}
-
-// Variable implements the VariableExpr interface.
-func (*QualifiedName) Variable() {}
-
-// StarExpr is a convenience function that represents an unqualified "*".
-func StarExpr() *QualifiedName {
-	return &QualifiedName{Indirect: Indirection{unqualifiedStar}}
-}
-
-// NormalizeTableName normalizes the qualified name to contain a database name
-// as prefix, returning an error if unable to do so or if the name is not a
-// valid table name (e.g. it contains an array indirection). The incoming
-// qualified name should have one of the following forms:
-//
-//   table
-//   database.table
-//   table@index
-//   database.table@index
-//
-// On successful normalization, the qualified name will have the form:
-//
-//   database.table@index
-func (node *QualifiedName) NormalizeTableName(database string) error {
-	if node == nil || node.Base == "" {
-		return fmt.Errorf("empty table name: %s", node)
-	}
-	if node.normalized == columnName {
-		return fmt.Errorf("already normalized as a column name: %s", node)
-	}
-	if err := node.QualifyWithDatabase(database); err != nil {
-		return err
-	}
-
-	if len(node.Indirect) > 1 {
-		return fmt.Errorf("invalid table name: %s", node)
-	}
-	node.normalized = tableName
-	return nil
-}
-
-// QualifyWithDatabase adds an indirection for the database, if it's missing.
-// It transforms:
-// table       -> database.table
-// table@index -> database.table@index
-// *           -> database.*
-func (node *QualifiedName) QualifyWithDatabase(database string) error {
-	node.setString()
-	if len(node.Indirect) == 0 {
-		if database == "" {
-			return fmt.Errorf("no database specified: %s", node)
-		}
-		// table -> database.table
-		if database == "" {
-			return fmt.Errorf("no database specified: %s", node)
-		}
-		node.Indirect = append(node.Indirect, NameIndirection(node.Base))
-		node.Base = Name(database)
-		node.normalized = tableName
-		return nil
-	}
-	switch node.Indirect[0].(type) {
-	case NameIndirection:
-		// Nothing to do.
-	case StarIndirection:
-		// * -> database.*
-		if node.Base != "" {
-			// nothing to do
-			return nil
-		}
-		if node.Base != "" {
-			node.Indirect = append(Indirection{NameIndirection(node.Base)}, node.Indirect...)
-		}
-		if database == "" {
-			return fmt.Errorf("no database specified: %s", node)
-		}
-		node.Base = Name(database)
-	}
-	return nil
-}
-
-// NormalizeColumnName normalizes the qualified name to contain a table name as
-// prefix, returning an error if unable to do so or if the name is not a valid
-// column name (e.g. it contains too many indirections). If normalization
-// occurred, the modified qualified name will have n.Base == "" to indicate no
-// explicit table was specified. The incoming qualified name should have one of
-// the following forms:
-//
-//   *
-//   table.*
-//   column
-//   column[array-indirection]
-//   table.column
-//   table.column[array-indirection]
-//
-// Note that "table" may be the empty string. On successful normalization the
-// qualified name will have one of the forms:
-//
-//   table.*
-//   table.column
-//   table.column[array-indirection]
-func (node *QualifiedName) NormalizeColumnName() error {
-	if node == nil {
-		return fmt.Errorf("empty column name: %s", node)
-	}
-	if node.normalized == tableName {
-		return fmt.Errorf("already normalized as a table name: %s", node)
-	}
-	node.setString()
-	if len(node.Indirect) == 0 {
-		// column -> table.column
-		if node.Base == "" {
-			return fmt.Errorf("empty column name: %s", node)
-		}
-		node.Indirect = append(node.Indirect, NameIndirection(node.Base))
-		node.Base = ""
-		node.normalized = columnName
-		return nil
-	}
-	if len(node.Indirect) > 2 {
-		return fmt.Errorf("invalid column name: %s", node)
-	}
-	// Either table.column, table.*, column[array-indirection] or
-	// table.column[array-indirection].
-	switch node.Indirect[0].(type) {
-	case NameIndirection:
-		// Nothing to do.
-	case StarIndirection:
-		node.Indirect[0] = qualifiedStar
-	case *ArrayIndirection:
-		// column[array-indirection] -> "".column[array-indirection]
-		//
-		// Accomplished by prepending node.Base to the existing indirection and then
-		// clearing node.Base.
-		node.Indirect = append(Indirection{NameIndirection(node.Base)}, node.Indirect...)
-		node.Base = ""
-	default:
-		return fmt.Errorf("invalid column name: %s", node)
-	}
-	if len(node.Indirect) == 2 {
-		if _, ok := node.Indirect[1].(*ArrayIndirection); !ok {
-			return fmt.Errorf("invalid column name: %s", node)
-		}
-	}
-	node.normalized = columnName
-	return nil
-}
-
-// Database returns the database portion of the name. Note that the returned
-// string is not quoted even if the name is a keyword.
-func (node *QualifiedName) Database() string {
-	if node.normalized != tableName {
-		panic(fmt.Sprintf("%s is not a table name", node))
-	}
-	// The database portion of the name is n.Base.
-	return string(node.Base)
-}
-
-// Table returns the table portion of the name. Note that the returned string
-// is not quoted even if the name is a keyword.
-func (node *QualifiedName) Table() string {
-	if node.normalized != tableName && node.normalized != columnName {
-		panic(fmt.Sprintf("%s is not a table or column name", node))
-	}
-	if node.normalized == tableName {
-		return string(node.Indirect[0].(NameIndirection))
-	}
-	return string(node.Base)
-}
-
-// Column returns the column portion of the name. Note that the returned string
-// is not quoted even if the name is a keyword.
-func (node *QualifiedName) Column() string {
-	if node.normalized != columnName {
-		panic(fmt.Sprintf("%s is not a column name", node))
-	}
-	return string(node.Indirect[0].(NameIndirection))
-}
-
-// IsStar returns true iff the qualified name contains matches "".* or table.*.
-func (node *QualifiedName) IsStar() bool {
-	if node.normalized != columnName {
-		panic(fmt.Sprintf("%s is not a column name", node))
-	}
-	if len(node.Indirect) != 1 {
-		return false
-	}
-	if _, ok := node.Indirect[0].(StarIndirection); !ok {
-		return false
-	}
-	return true
-}
-
-// ClearString causes String to return the current (possibly normalized) name instead of the
-// original name (used for testing).
-func (node *QualifiedName) ClearString() {
-	node.origString = ""
-}
-
-func (node *QualifiedName) setString() {
-	// We preserve the representation pre-normalization.
-	if node.origString != "" {
-		return
-	}
-	var buf bytes.Buffer
-	if node.Base == "" && len(node.Indirect) == 1 && node.Indirect[0] == unqualifiedStar {
-		FormatNode(&buf, FmtSimple, node.Indirect[0])
-	} else {
-		FormatNode(&buf, FmtSimple, node.Base)
-		FormatNode(&buf, FmtSimple, node.Indirect)
-	}
-	node.origString = buf.String()
-}
-
-// Format implements the NodeFormatter interface.
-func (node *QualifiedName) Format(buf *bytes.Buffer, f FmtFlags) {
-	node.setString()
-	buf.WriteString(node.origString)
-}
-
-// QualifiedNames represents a command separated list (see the String method)
-// of qualified names.
-type QualifiedNames []*QualifiedName
-
-// Format implements the NodeFormatter interface.
-func (n QualifiedNames) Format(buf *bytes.Buffer, f FmtFlags) {
-	for i, e := range n {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		FormatNode(buf, f, e)
-	}
-}
-
-// TableNameWithIndex represents a "table@index", used in statements that
-// specifically refer to an index.
-type TableNameWithIndex struct {
-	Table *QualifiedName
-	Index Name
-}
-
-// Format implements the NodeFormatter interface.
-func (n *TableNameWithIndex) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, n.Table)
-	buf.WriteByte('@')
-	FormatNode(buf, f, n.Index)
-}
-
-// TableNameWithIndexList is a list of indexes.
-type TableNameWithIndexList []*TableNameWithIndex
-
-// Format implements the NodeFormatter interface.
-func (n TableNameWithIndexList) Format(buf *bytes.Buffer, f FmtFlags) {
-	for i, e := range n {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		FormatNode(buf, f, e)
-	}
 }
 
 // Tuple represents a parenthesized list of expressions.
@@ -967,6 +714,25 @@ func (node *BinaryExpr) memoizeFn() {
 	node.fn = fn
 }
 
+// newBinExprIfValidOverload constructs a new BinaryExpr if and only
+// if the pair of arguments have a valid implementation for the given
+// BinaryOperator.
+func newBinExprIfValidOverload(op BinaryOperator, left TypedExpr, right TypedExpr) *BinaryExpr {
+	leftRet, rightRet := left.ReturnType(), right.ReturnType()
+	fn, ok := BinOps[op].lookupImpl(leftRet, rightRet)
+	if ok {
+		expr := &BinaryExpr{
+			Operator: op,
+			Left:     left,
+			Right:    right,
+			fn:       fn,
+		}
+		expr.typ = fn.returnType()
+		return expr
+	}
+	return nil
+}
+
 // Format implements the NodeFormatter interface.
 func (node *BinaryExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	binExprFmtWithParen(buf, f, node.Left, node.Operator.String(), node.Right)
@@ -1013,9 +779,14 @@ func (node *UnaryExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	exprFmtWithParen(buf, f, node.Expr)
 }
 
+// TypedInnerExpr returns the UnaryExpr's inner expression as a TypedExpr.
+func (node *UnaryExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
+}
+
 // FuncExpr represents a function call.
 type FuncExpr struct {
-	Name  *QualifiedName
+	Name  NormalizableFunctionName
 	Type  funcType
 	Exprs Exprs
 
@@ -1043,12 +814,7 @@ func (node *FuncExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.Type != 0 {
 		typ = funcTypeName[node.Type] + " "
 	}
-	// TODO(nvanbenschoten) We should probably either remove
-	// *QualifiedName as a TypedExpr or special case it in
-	// FormatNode. The reason it's a TypedExpr in the first place is for
-	// testing (I believe), but this doesn't seem like a good enough
-	// reason to justify the strangeness.
-	buf.WriteString(node.Name.String())
+	FormatNode(buf, f, node.Name)
 	buf.WriteByte('(')
 	buf.WriteString(typ)
 	FormatNode(buf, f, node.Exprs)
@@ -1147,8 +913,8 @@ var (
 	intervalCastTypes  = []Datum{DNull, TypeString, TypeInt, TypeInterval}
 )
 
-func (node *CastExpr) castTypeAndValidArgTypes() (Datum, []Datum) {
-	switch node.Type.(type) {
+func colTypeToTypeAndValidArgTypes(t ColumnType) (Datum, []Datum) {
+	switch t.(type) {
 	case *BoolColType:
 		return TypeBool, boolCastTypes
 	case *IntColType:
@@ -1171,6 +937,37 @@ func (node *CastExpr) castTypeAndValidArgTypes() (Datum, []Datum) {
 		return TypeInterval, intervalCastTypes
 	}
 	return nil, nil
+}
+
+func (node *CastExpr) castTypeAndValidArgTypes() (Datum, []Datum) {
+	return colTypeToTypeAndValidArgTypes(node.Type)
+}
+
+// AnnotateTypeExpr represents a ANNOTATE_TYPE(expr, type) expression.
+type AnnotateTypeExpr struct {
+	Expr Expr
+	Type ColumnType
+
+	typeAnnotation
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AnnotateTypeExpr) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("ANNOTATE_TYPE(")
+	FormatNode(buf, f, node.Expr)
+	buf.WriteString(", ")
+	FormatNode(buf, f, node.Type)
+	buf.WriteByte(')')
+}
+
+// TypedInnerExpr returns the AnnotateTypeExpr's inner expression as a TypedExpr.
+func (node *AnnotateTypeExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
+}
+
+func (node *AnnotateTypeExpr) annotationType() Datum {
+	typ, _ := colTypeToTypeAndValidArgTypes(node.Type)
+	return typ
 }
 
 func (node *AliasedTableExpr) String() string { return AsString(node) }
@@ -1208,11 +1005,11 @@ func (node *NumVal) String() string           { return AsString(node) }
 func (node *OrExpr) String() string           { return AsString(node) }
 func (node *OverlayExpr) String() string      { return AsString(node) }
 func (node *ParenExpr) String() string        { return AsString(node) }
-func (node *QualifiedName) String() string    { return AsString(node) }
 func (node *RangeCond) String() string        { return AsString(node) }
 func (node *StrVal) String() string           { return AsString(node) }
 func (node *Subquery) String() string         { return AsString(node) }
 func (node *Tuple) String() string            { return AsString(node) }
+func (node *AnnotateTypeExpr) String() string { return AsString(node) }
 func (node *UnaryExpr) String() string        { return AsString(node) }
 func (node DefaultVal) String() string        { return AsString(node) }
 func (node Placeholder) String() string       { return AsString(node) }

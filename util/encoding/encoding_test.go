@@ -75,7 +75,7 @@ func testCustomEncodeUint32(testCases []testCaseUint32,
 	encFunc func([]byte, uint32) []byte, t *testing.T) {
 	for _, test := range testCases {
 		enc := encFunc(nil, test.value)
-		if bytes.Compare(enc, test.expEnc) != 0 {
+		if !bytes.Equal(enc, test.expEnc) {
 			t.Errorf("expected [% x]; got [% x]", test.expEnc, enc)
 		}
 	}
@@ -222,7 +222,7 @@ func testCustomEncodeInt64(testCases []testCaseInt64,
 	encFunc func([]byte, int64) []byte, t *testing.T) {
 	for _, test := range testCases {
 		enc := encFunc(nil, test.value)
-		if bytes.Compare(enc, test.expEnc) != 0 {
+		if !bytes.Equal(enc, test.expEnc) {
 			t.Errorf("expected [% x]; got [% x] (value: %d)", test.expEnc, enc, test.value)
 		}
 	}
@@ -237,7 +237,7 @@ func testCustomEncodeUint64(testCases []testCaseUint64,
 	encFunc func([]byte, uint64) []byte, t *testing.T) {
 	for _, test := range testCases {
 		enc := encFunc(nil, test.value)
-		if bytes.Compare(enc, test.expEnc) != 0 {
+		if !bytes.Equal(enc, test.expEnc) {
 			t.Errorf("expected [% x]; got [% x] (value: %d)", test.expEnc, enc, test.value)
 		}
 	}
@@ -794,7 +794,7 @@ func testCustomEncodeDuration(
 		if err != nil {
 			t.Fatal(err)
 		}
-		if bytes.Compare(enc, test.expEnc) != 0 {
+		if !bytes.Equal(enc, test.expEnc) {
 			t.Errorf("%d expected [% x]; got [% x] (value: %d)", i, test.expEnc, enc, test.value)
 		}
 		_, decoded, err := decFunc(enc)
@@ -1727,6 +1727,45 @@ func TestValueEncodingRand(t *testing.T) {
 			if decoded != value {
 				t.Fatalf("seed %d: %s got %v expected %v", seed, typ, decoded, value)
 			}
+		}
+	}
+}
+
+func TestUpperBoundValueEncodingSize(t *testing.T) {
+	tests := []struct {
+		colID uint32
+		typ   Type
+		width int
+		size  int // -1 means unbounded
+	}{
+		{colID: 0, typ: Null, size: 1},
+		{colID: 0, typ: True, size: 1},
+		{colID: 0, typ: False, size: 1},
+		{colID: 0, typ: Int, size: 10},
+		{colID: 0, typ: Int, width: 100, size: 10},
+		{colID: 0, typ: Float, size: 9},
+		{colID: 0, typ: Decimal, size: -1},
+		{colID: 0, typ: Decimal, width: 100, size: 68},
+		{colID: 0, typ: Time, size: 19},
+		{colID: 0, typ: Duration, size: 28},
+		{colID: 0, typ: Bytes, size: -1},
+		{colID: 0, typ: Bytes, width: 100, size: 110},
+
+		{colID: 8, typ: True, size: 2},
+	}
+	for i, test := range tests {
+		testIsBounded := test.size != -1
+		size, isBounded := UpperBoundValueEncodingSize(test.colID, test.typ, test.width)
+		if isBounded != testIsBounded {
+			if isBounded {
+				t.Errorf("%d: expected unbounded but got bounded", i)
+			} else {
+				t.Errorf("%d: expected bounded but got unbounded", i)
+			}
+			continue
+		}
+		if isBounded && size != test.size {
+			t.Errorf("%d: got size %d but expected %d", i, size, test.size)
 		}
 	}
 }

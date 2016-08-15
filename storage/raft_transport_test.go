@@ -18,8 +18,11 @@ package storage_test
 
 import (
 	"math/rand"
+	"net"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/gogo/protobuf/proto"
@@ -31,13 +34,20 @@ import (
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/metric"
 	"github.com/cockroachdb/cockroach/util/netutil"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
+const channelServerBrokenRangeMessage = "channelServer broken range"
+
 type channelServer struct {
 	ch       chan *storage.RaftMessageRequest
 	maxSleep time.Duration
+
+	// If non-zero, all messages to this range will return errors
+	brokenRange roachpb.RangeID
 }
 
 func newChannelServer(bufSize int, maxSleep time.Duration) channelServer {
@@ -47,24 +57,123 @@ func newChannelServer(bufSize int, maxSleep time.Duration) channelServer {
 	}
 }
 
-func (s channelServer) RaftMessage(req *storage.RaftMessageRequest) error {
+func (s channelServer) HandleRaftRequest(
+	ctx context.Context, req *storage.RaftMessageRequest,
+) *roachpb.Error {
 	if s.maxSleep != 0 {
 		// maxSleep simulates goroutine scheduling delays that could
 		// result in messages being processed out of order (in previous
 		// transport implementations).
 		time.Sleep(time.Duration(rand.Int63n(int64(s.maxSleep))))
 	}
+	if s.brokenRange != 0 && s.brokenRange == req.RangeID {
+		return roachpb.NewErrorf(channelServerBrokenRangeMessage)
+	}
 	s.ch <- req
 	return nil
 }
 
+func (s channelServer) HandleRaftResponse(ctx context.Context, resp *storage.RaftMessageResponse) {
+	log.Fatalf(ctx, "unexpected raft response: %s", resp)
+}
+
+// raftTransportTestContext contains objects needed to test RaftTransport.
+// Typical usage will add multiple nodes with AddNode, attach channels
+// to at least one store with ListenStore, and send messages with Send.
+type raftTransportTestContext struct {
+	t              testing.TB
+	stopper        *stop.Stopper
+	transports     map[roachpb.NodeID]*storage.RaftTransport
+	nodeRPCContext *rpc.Context
+	gossip         *gossip.Gossip
+}
+
+func newRaftTransportTestContext(t testing.TB) *raftTransportTestContext {
+	rttc := &raftTransportTestContext{
+		t:          t,
+		stopper:    stop.NewStopper(),
+		transports: map[roachpb.NodeID]*storage.RaftTransport{},
+	}
+	rttc.nodeRPCContext = rpc.NewContext(testutils.NewNodeTestBaseContext(), nil, rttc.stopper)
+	server := rpc.NewServer(rttc.nodeRPCContext) // never started
+	rttc.gossip = gossip.New(rttc.nodeRPCContext, server, nil, rttc.stopper, metric.NewRegistry())
+	rttc.gossip.SetNodeID(1)
+	return rttc
+}
+
+func (rttc *raftTransportTestContext) Stop() {
+	rttc.stopper.Stop()
+}
+
+// AddNode registers a node with the cluster. Nodes must be added
+// before they can be used in other methods of
+// raftTransportTestContext. The node will be gossiped immediately.
+func (rttc *raftTransportTestContext) AddNode(nodeID roachpb.NodeID) *storage.RaftTransport {
+	transport, addr := rttc.AddNodeWithoutGossip(nodeID)
+	rttc.GossipNode(nodeID, addr)
+	return transport
+}
+
+// AddNodeWithoutGossip registers a node with the cluster. Nodes must
+// be added before they can be used in other methods of
+// raftTransportTestContext. Unless you are testing the effects of
+// delaying gossip, use AddNode instead.
+func (rttc *raftTransportTestContext) AddNodeWithoutGossip(
+	nodeID roachpb.NodeID,
+) (*storage.RaftTransport, net.Addr) {
+	grpcServer := rpc.NewServer(rttc.nodeRPCContext)
+	ln, err := netutil.ListenAndServeGRPC(rttc.stopper, grpcServer, util.TestAddr)
+	if err != nil {
+		rttc.t.Fatal(err)
+	}
+	transport := storage.NewRaftTransport(storage.GossipAddressResolver(rttc.gossip),
+		grpcServer, rttc.nodeRPCContext)
+	rttc.transports[nodeID] = transport
+	return transport, ln.Addr()
+}
+
+// GossipNode gossips the node's address, which is necessary before
+// any messages can be sent to it. Normally done automatically by
+// AddNode.
+func (rttc *raftTransportTestContext) GossipNode(nodeID roachpb.NodeID, addr net.Addr) {
+	if err := rttc.gossip.AddInfoProto(gossip.MakeNodeIDKey(nodeID),
+		&roachpb.NodeDescriptor{
+			Address: util.MakeUnresolvedAddr(addr.Network(), addr.String()),
+		},
+		time.Hour); err != nil {
+		rttc.t.Fatal(err)
+	}
+}
+
+// ListenStore registers a store on a node and returns a channel for
+// messages sent to that store.
+func (rttc *raftTransportTestContext) ListenStore(
+	nodeID roachpb.NodeID, storeID roachpb.StoreID,
+) channelServer {
+	ch := newChannelServer(100, 10*time.Millisecond)
+	rttc.transports[nodeID].Listen(storeID, ch)
+	return ch
+}
+
+// Send a message. Returns false if the message was dropped.
+func (rttc *raftTransportTestContext) Send(
+	from, to roachpb.ReplicaDescriptor, rangeID roachpb.RangeID, msg raftpb.Message,
+) bool {
+	msg.To = uint64(to.ReplicaID)
+	msg.From = uint64(from.ReplicaID)
+	req := &storage.RaftMessageRequest{
+		RangeID:     rangeID,
+		Message:     msg,
+		ToReplica:   to,
+		FromReplica: from,
+	}
+	return rttc.transports[from.NodeID].SendAsync(req)
+}
+
 func TestSendAndReceive(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop()
-	nodeRPCContext := rpc.NewContext(testutils.NewNodeTestBaseContext(), nil, stopper)
-	g := gossip.New(nodeRPCContext, nil, stopper)
-	g.SetNodeID(roachpb.NodeID(1))
+	rttc := newRaftTransportTestContext(t)
+	defer rttc.Stop()
 
 	// Create several servers, each of which has two stores (A raft
 	// node ID addresses a store). Node 1 has stores 1 and 2, node 2 has
@@ -99,24 +208,8 @@ func TestSendAndReceive(t *testing.T) {
 	for nodeIndex := 0; nodeIndex < numNodes; nodeIndex++ {
 		nodeID := nextNodeID
 		nextNodeID++
-		grpcServer := rpc.NewServer(nodeRPCContext)
-		ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, util.TestAddr)
-		if err != nil {
-			t.Fatal(err)
-		}
+		transports[nodeID] = rttc.AddNode(nodeID)
 
-		addr := ln.Addr()
-		// Have to call g.SetNodeID before call g.AddInfo.
-		g.ResetNodeID(roachpb.NodeID(nodeID))
-		if err := g.AddInfoProto(gossip.MakeNodeIDKey(nodeID),
-			&roachpb.NodeDescriptor{
-				Address: util.MakeUnresolvedAddr(addr.Network(), addr.String()),
-			},
-			time.Hour); err != nil {
-			t.Fatal(err)
-		}
-
-		transports[nodeID] = storage.NewRaftTransport(storage.GossipAddressResolver(g), grpcServer, nodeRPCContext)
 		// This channel is normally unbuffered, but it is also normally serviced by
 		// the raft goroutine. Since we don't have that goroutine in this test, we
 		// must buffer the channel to prevent snapshots from blocking while we
@@ -133,10 +226,7 @@ func TestSendAndReceive(t *testing.T) {
 
 			storeNodes[storeID] = nodeID
 
-			sendersPerRecipient := numNodes * storesPerNode
-			inboundMessagesPerStore := sendersPerRecipient * len(messageTypes)
-			channels[storeID] = newChannelServer(inboundMessagesPerStore, 0)
-			transports[nodeID].Listen(storeID, channels[storeID].RaftMessage)
+			channels[storeID] = rttc.ListenStore(nodeID, storeID)
 		}
 	}
 
@@ -151,6 +241,7 @@ func TestSendAndReceive(t *testing.T) {
 
 		for fromStoreID, fromNodeID := range storeNodes {
 			baseReq := storage.RaftMessageRequest{
+				RangeID: 1,
 				Message: raftpb.Message{
 					From: uint64(fromStoreID),
 					To:   uint64(toStoreID),
@@ -169,8 +260,8 @@ func TestSendAndReceive(t *testing.T) {
 				req := baseReq
 				req.Message.Type = messageType
 
-				if err := transports[fromNodeID].Send(&req); err != nil {
-					t.Errorf("unable to send %s from %d to %d: %s", req.Message.Type, fromNodeID, toNodeID, err)
+				if !transports[fromNodeID].SendAsync(&req) {
+					t.Errorf("unable to send %s from %d to %d", req.Message.Type, fromNodeID, toNodeID)
 				}
 				messageTypeCounts[toStoreID][req.Message.Type]++
 			}
@@ -231,7 +322,7 @@ func TestSendAndReceive(t *testing.T) {
 	fromStoreID := roachpb.StoreID(3)
 	toStoreID := roachpb.StoreID(5)
 	expReq := &storage.RaftMessageRequest{
-		GroupID: 1,
+		RangeID: 1,
 		Message: raftpb.Message{
 			Type: raftpb.MsgApp,
 			From: uint64(replicaIDs[fromStoreID]),
@@ -248,8 +339,8 @@ func TestSendAndReceive(t *testing.T) {
 			ReplicaID: replicaIDs[toStoreID],
 		},
 	}
-	if err := transports[storeNodes[fromStoreID]].Send(expReq); err != nil {
-		t.Errorf("unable to send message from %d to %d: %s", fromStoreID, toStoreID, err)
+	if !transports[storeNodes[fromStoreID]].SendAsync(expReq) {
+		t.Errorf("unable to send message from %d to %d", fromStoreID, toStoreID)
 	}
 	if req := <-channels[toStoreID].ch; !proto.Equal(req, expReq) {
 		t.Errorf("got unexpected message %v on channel %d", req, toStoreID)
@@ -266,57 +357,28 @@ func TestSendAndReceive(t *testing.T) {
 // messages are delivered in order.
 func TestInOrderDelivery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop()
-	nodeRPCContext := rpc.NewContext(testutils.NewNodeTestBaseContext(), nil, stopper)
-	g := gossip.New(nodeRPCContext, nil, stopper)
-
-	grpcServer := rpc.NewServer(nodeRPCContext)
-	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, util.TestAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rttc := newRaftTransportTestContext(t)
+	defer rttc.Stop()
 
 	const numMessages = 100
-	nodeID := roachpb.NodeID(roachpb.NodeID(2))
-	serverTransport := storage.NewRaftTransport(storage.GossipAddressResolver(g), grpcServer, nodeRPCContext)
-	serverChannel := newChannelServer(numMessages, 10*time.Millisecond)
-	serverTransport.Listen(roachpb.StoreID(nodeID), serverChannel.RaftMessage)
-	addr := ln.Addr()
-	// Have to set gossip.NodeID before calling gossip.AddInfoXXX.
-	g.SetNodeID(nodeID)
-	if err := g.AddInfoProto(gossip.MakeNodeIDKey(nodeID),
-		&roachpb.NodeDescriptor{
-			Address: util.MakeUnresolvedAddr(addr.Network(), addr.String()),
-		},
-		time.Hour); err != nil {
-		t.Fatal(err)
+	serverReplica := roachpb.ReplicaDescriptor{
+		NodeID:    2,
+		StoreID:   2,
+		ReplicaID: 2,
 	}
+	rttc.AddNode(serverReplica.NodeID)
+	serverChannel := rttc.ListenStore(serverReplica.NodeID, serverReplica.StoreID)
 
-	clientNodeID := roachpb.NodeID(2)
-	clientTransport := storage.NewRaftTransport(storage.GossipAddressResolver(g), nil, nodeRPCContext)
+	clientReplica := roachpb.ReplicaDescriptor{
+		NodeID:    1,
+		StoreID:   1,
+		ReplicaID: 1,
+	}
+	rttc.AddNode(clientReplica.NodeID)
 
 	for i := 0; i < numMessages; i++ {
-		req := &storage.RaftMessageRequest{
-			GroupID: 1,
-			Message: raftpb.Message{
-				To:     uint64(nodeID),
-				From:   uint64(clientNodeID),
-				Commit: uint64(i),
-			},
-			ToReplica: roachpb.ReplicaDescriptor{
-				NodeID:    nodeID,
-				StoreID:   roachpb.StoreID(nodeID),
-				ReplicaID: roachpb.ReplicaID(nodeID),
-			},
-			FromReplica: roachpb.ReplicaDescriptor{
-				NodeID:    clientNodeID,
-				StoreID:   roachpb.StoreID(clientNodeID),
-				ReplicaID: roachpb.ReplicaID(clientNodeID),
-			},
-		}
-		if err := clientTransport.Send(req); err != nil {
-			t.Errorf("failed to send message %d: %s", i, err)
+		if !rttc.Send(clientReplica, serverReplica, 1, raftpb.Message{Commit: uint64(i)}) {
+			t.Errorf("failed to send message %d", i)
 		}
 	}
 
@@ -324,6 +386,106 @@ func TestInOrderDelivery(t *testing.T) {
 		req := <-serverChannel.ch
 		if req.Message.Commit != uint64(i) {
 			t.Errorf("messages out of order: got %d while expecting %d", req.Message.Commit, i)
+		}
+	}
+}
+
+// TestRaftTransportCircuitBreaker verifies that messages will be
+// dropped waiting for raft node connection to be established.
+func TestRaftTransportCircuitBreaker(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	rttc := newRaftTransportTestContext(t)
+	defer rttc.Stop()
+
+	serverReplica := roachpb.ReplicaDescriptor{
+		NodeID:    2,
+		StoreID:   2,
+		ReplicaID: 2,
+	}
+	_, serverAddr := rttc.AddNodeWithoutGossip(serverReplica.NodeID)
+	serverChannel := rttc.ListenStore(serverReplica.NodeID, serverReplica.StoreID)
+
+	clientReplica := roachpb.ReplicaDescriptor{
+		NodeID:    1,
+		StoreID:   1,
+		ReplicaID: 1,
+	}
+	clientTransport := rttc.AddNode(clientReplica.NodeID)
+
+	if rttc.Send(clientReplica, serverReplica, 1, raftpb.Message{Commit: 1}) {
+		t.Errorf("succeeded in sending when message should be dropped")
+	}
+
+	// None should go through as the receiving node's address has not been gossiped.
+	select {
+	case req := <-serverChannel.ch:
+		t.Fatalf("should not have received any Raft messages from client: %s", req)
+	default:
+	}
+
+	// Now, gossip address of server.
+	rttc.GossipNode(serverReplica.NodeID, serverAddr)
+
+	// Message was dropped, not queued, so still shouldn't just appear.
+	select {
+	case req := <-serverChannel.ch:
+		t.Fatalf("should not have received any Raft messages from client: %s", req)
+	default:
+	}
+
+	// Reset the circuit breaker & resend and verify message arrives at server.
+	clientTransport.GetCircuitBreaker(serverReplica.NodeID).Reset()
+	if !rttc.Send(clientReplica, serverReplica, 1, raftpb.Message{Commit: 1}) {
+		t.Errorf("sent raft message was unexpectedly dropped")
+	}
+
+	req := <-serverChannel.ch
+	if req.Message.Commit != 1 {
+		t.Errorf("expected message 1; got %s", req)
+	}
+}
+
+// TestRaftTransportIndependentRanges ensures that errors from one
+// range do not interfere with messages to another range on the same
+// store.
+func TestRaftTransportIndependentRanges(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	rttc := newRaftTransportTestContext(t)
+	defer rttc.Stop()
+
+	server := roachpb.ReplicaDescriptor{
+		NodeID:    1,
+		StoreID:   1,
+		ReplicaID: 1,
+	}
+	serverTransport := rttc.AddNode(server.NodeID)
+	client := roachpb.ReplicaDescriptor{
+		NodeID:    2,
+		StoreID:   2,
+		ReplicaID: 2,
+	}
+	rttc.AddNode(client.NodeID)
+
+	const numMessages = 50
+	channelServer := newChannelServer(numMessages*2, 10*time.Millisecond)
+	channelServer.brokenRange = 13
+	serverTransport.Listen(server.StoreID, channelServer)
+
+	for i := 0; i < numMessages; i++ {
+		for _, rangeID := range []roachpb.RangeID{1, 13} {
+			if !rttc.Send(client, server, rangeID, raftpb.Message{Commit: uint64(i)}) {
+				t.Errorf("failed to send message %d to range %s", i, rangeID)
+			}
+		}
+	}
+	for i := 0; i < numMessages; i++ {
+		select {
+		case msg := <-channelServer.ch:
+			if msg.Message.Commit != uint64(i) {
+				t.Errorf("got message %d while expecting %d", msg.Message.Commit, i)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timeout waiting for message %d", i)
 		}
 	}
 }

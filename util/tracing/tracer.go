@@ -46,12 +46,13 @@ func (cr CallbackRecorder) RecordSpan(sp basictracer.RawSpan) {
 // creates Span from the given tracer.
 func JoinOrNew(tr opentracing.Tracer, carrier *Span, opName string) (opentracing.Span, error) {
 	if carrier != nil {
-		sp, err := tr.Join(opName, basictracer.Delegator, carrier)
+		wireContext, err := tr.Extract(basictracer.Delegator, carrier)
 		switch err {
 		case nil:
+			sp := tr.StartSpan(opName, opentracing.FollowsFrom(wireContext))
 			sp.LogEvent(opName)
 			return sp, nil
-		case opentracing.ErrTraceNotFound:
+		case opentracing.ErrSpanContextNotFound:
 		default:
 			return nil, err
 		}

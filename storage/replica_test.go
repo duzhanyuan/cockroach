@@ -33,13 +33,14 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/coreos/etcd/raft"
+	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
@@ -52,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/metric"
 	"github.com/cockroachdb/cockroach/util/protoutil"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/uuid"
@@ -96,20 +98,11 @@ const (
 	bootstrapRangeOnly
 )
 
-// LeaderLeaseExpiration returns an int64 to increment a manual clock with to
-// make sure that all active leader leases expire.
-func LeaderLeaseExpiration(s *Store, clock *hlc.Clock) int64 {
-	// Due to lease extensions, the remaining interval can be longer than just
-	// the sum of the offset (=length of stasis period) and the active
-	// duration, but definitely not by 2x.
-	return 2 * int64(s.ctx.leaderLeaseActiveDuration+clock.MaxOffset())
-}
-
-// leaseExpiry returns a duration in nanos after which any leader lease the
-// Replica may hold is expired. It is more precise than LeaderLeaseExpiration
+// leaseExpiry returns a duration in nanos after which any range lease the
+// Replica may hold is expired. It is more precise than LeaseExpiration
 // in that it returns the minimal duration necessary.
 func leaseExpiry(rng *Replica) int64 {
-	if l, _ := rng.getLeaderLease(); l != nil {
+	if l, _ := rng.getLease(); l != nil {
 		return l.Expiration.WallTime + 1
 	}
 	return 0
@@ -150,8 +143,9 @@ func (tc *testContext) StartWithStoreContext(t testing.TB, ctx StoreContext) {
 	// Setup fake zone config handler.
 	config.TestingSetupZoneConfigHook(tc.stopper)
 	if tc.gossip == nil {
-		rpcContext := rpc.NewContext(nil, nil, tc.stopper)
-		tc.gossip = gossip.New(rpcContext, nil, tc.stopper)
+		rpcContext := rpc.NewContext(&base.Context{Insecure: true}, nil, tc.stopper)
+		server := rpc.NewServer(rpcContext) // never started
+		tc.gossip = gossip.New(rpcContext, server, nil, tc.stopper, metric.NewRegistry())
 		tc.gossip.SetNodeID(1)
 	}
 	if tc.manualClock == nil {
@@ -206,6 +200,7 @@ func (tc *testContext) StartWithStoreContext(t testing.TB, ctx StoreContext) {
 		if tc.bootstrapMode == bootstrapRangeOnly {
 			testDesc := testRangeDescriptor()
 			if _, err := writeInitialState(
+				context.Background(),
 				tc.store.Engine(),
 				enginepb.MVCCStats{},
 				*testDesc,
@@ -250,7 +245,7 @@ func (tc *testContext) Sender() client.Sender {
 // SendWrappedWith is a convenience function which wraps the request in a batch
 // and sends it
 func (tc *testContext) SendWrappedWith(h roachpb.Header, args roachpb.Request) (roachpb.Response, *roachpb.Error) {
-	return client.SendWrappedWith(tc.Sender(), tc.rng.context(context.Background()), h, args)
+	return client.SendWrappedWith(tc.Sender(), context.Background(), h, args)
 }
 
 // SendWrapped is identical to SendWrappedWith with a zero header.
@@ -365,6 +360,7 @@ func TestReplicaContains(t *testing.T) {
 	// This test really only needs a hollow shell of a Replica.
 	r := &Replica{}
 	r.mu.state.Desc = desc
+	r.rangeDesc.Store(desc)
 
 	if statsKey := keys.RangeStatsKey(desc.RangeID); !r.ContainsKey(statsKey) {
 		t.Errorf("expected range to contain range stats key %q", statsKey)
@@ -384,11 +380,11 @@ func TestReplicaContains(t *testing.T) {
 	}
 }
 
-func setLeaderLease(r *Replica, l *roachpb.Lease) error {
+func sendLeaseRequest(r *Replica, l *roachpb.Lease) error {
 	ba := roachpb.BatchRequest{}
 	ba.Timestamp = r.store.Clock().Now()
-	ba.Add(&roachpb.LeaderLeaseRequest{Lease: *l})
-	ch, _, err := r.proposeRaftCommand(r.context(context.Background()), ba)
+	ba.Add(&roachpb.RequestLeaseRequest{Lease: *l})
+	ch, _, err := r.proposeRaftCommand(context.Background(), ba)
 	if err == nil {
 		// Next if the command was committed, wait for the range to apply it.
 		// TODO(bdarnell): refactor this to a more conventional error-handling pattern.
@@ -399,14 +395,14 @@ func setLeaderLease(r *Replica, l *roachpb.Lease) error {
 
 // TestReplicaReadConsistency verifies behavior of the range under
 // different read consistencies. Note that this unittest plays
-// fast and loose with granting leader leases.
+// fast and loose with granting range leases.
 func TestReplicaReadConsistency(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
 
-	// Modify range descriptor to include a second replica; leader lease can
+	// Modify range descriptor to include a second replica; range lease can
 	// only be obtained by Replicas which are part of the range descriptor. This
 	// workaround is sufficient for the purpose of this test.
 	secondReplica := roachpb.ReplicaDescriptor{
@@ -444,11 +440,11 @@ func TestReplicaReadConsistency(t *testing.T) {
 		t.Errorf("expected error on inconsistent read within a txn")
 	}
 
-	// Lose the lease and verify CONSISTENT reads receive NotLeaderError
+	// Lose the lease and verify CONSISTENT reads receive NotLeaseHolderError
 	// and INCONSISTENT reads work as expected.
 	start := hlc.ZeroTimestamp.Add(leaseExpiry(tc.rng), 0)
 	tc.manualClock.Set(start.WallTime)
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       start,
 		StartStasis: start.Add(10, 0),
 		Expiration:  start.Add(10, 0),
@@ -465,8 +461,8 @@ func TestReplicaReadConsistency(t *testing.T) {
 	_, pErr := tc.SendWrappedWith(roachpb.Header{
 		ReadConsistency: roachpb.CONSISTENT,
 	}, &gArgs)
-	if _, ok := pErr.GetDetail().(*roachpb.NotLeaderError); !ok {
-		t.Errorf("expected not leader error; got %s", pErr)
+	if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok {
+		t.Errorf("expected not lease holder error; got %s", pErr)
 	}
 
 	if _, pErr := tc.SendWrappedWith(roachpb.Header{
@@ -477,7 +473,7 @@ func TestReplicaReadConsistency(t *testing.T) {
 }
 
 // TestApplyCmdLeaseError verifies that when during application of a Raft
-// command the proposing node no longer holds the leader lease, an error is
+// command the proposing node no longer holds the range lease, an error is
 // returned. This prevents regression of #1483.
 func TestApplyCmdLeaseError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -485,7 +481,7 @@ func TestApplyCmdLeaseError(t *testing.T) {
 	tc.Start(t)
 	defer tc.Stop()
 
-	// Modify range descriptor to include a second replica; leader lease can
+	// Modify range descriptor to include a second replica; range lease can
 	// only be obtained by Replicas which are part of the range descriptor. This
 	// workaround is sufficient for the purpose of this test.
 	secondReplica := roachpb.ReplicaDescriptor{
@@ -502,7 +498,7 @@ func TestApplyCmdLeaseError(t *testing.T) {
 	// Lose the lease.
 	start := hlc.ZeroTimestamp.Add(leaseExpiry(tc.rng), 0)
 	tc.manualClock.Set(start.WallTime)
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       start,
 		StartStasis: start.Add(10, 0),
 		Expiration:  start.Add(10, 0),
@@ -518,8 +514,8 @@ func TestApplyCmdLeaseError(t *testing.T) {
 	_, pErr := tc.SendWrappedWith(roachpb.Header{
 		Timestamp: tc.clock.Now().Add(-100, 0),
 	}, &pArgs)
-	if _, ok := pErr.GetDetail().(*roachpb.NotLeaderError); !ok {
-		t.Fatalf("expected not leader error in return, got %v", pErr)
+	if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok {
+		t.Fatalf("expected not lease holder error in return, got %v", pErr)
 	}
 }
 
@@ -532,7 +528,7 @@ func TestReplicaRangeBoundsChecking(t *testing.T) {
 	key := roachpb.RKey("a")
 	firstRng := tc.store.LookupReplica(key, nil)
 	newRng := splitTestRange(tc.store, key, key, t)
-	if pErr := newRng.redirectOnOrAcquireLeaderLease(context.Background()); pErr != nil {
+	if pErr := newRng.redirectOnOrAcquireLease(context.Background()); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -551,33 +547,18 @@ func TestReplicaRangeBoundsChecking(t *testing.T) {
 	}
 }
 
-// hasLease returns whether the most recent leader lease was held by the given
+// hasLease returns whether the most recent range lease was held by the given
 // range replica and whether it's expired for the given timestamp.
 func hasLease(rng *Replica, timestamp hlc.Timestamp) (owned bool, expired bool) {
-	l, _ := rng.getLeaderLease()
+	l, _ := rng.getLease()
 	return l.OwnedBy(rng.store.StoreID()), !l.Covers(timestamp)
 }
 
-func TestReplicaLeaderLease(t *testing.T) {
+func TestReplicaLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
-
-	one := hlc.ZeroTimestamp.Add(1, 0)
-
-	for _, lease := range []roachpb.Lease{
-		{StartStasis: one},
-		{Start: one, StartStasis: one},
-		{Expiration: one, StartStasis: one.Next()},
-	} {
-		if _, err := tc.rng.LeaderLease(context.Background(), tc.store.Engine(), nil,
-			roachpb.Header{}, roachpb.LeaderLeaseRequest{
-				Lease: lease,
-			}); !testutils.IsError(err, "illegal lease interval") {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	}
 
 	// Modify range descriptor to include a second replica; leader lease can
 	// only be obtained by Replicas which are part of the range descriptor. This
@@ -591,12 +572,27 @@ func TestReplicaLeaderLease(t *testing.T) {
 	rngDesc.Replicas = append(rngDesc.Replicas, secondReplica)
 	tc.rng.setDescWithoutProcessUpdate(rngDesc)
 
+	// Test that leases with invalid times are rejected.
+	// Start leases at a point that avoids overlapping with the existing lease.
+	one := hlc.ZeroTimestamp.Add(time.Second.Nanoseconds(), 0)
+	for _, lease := range []roachpb.Lease{
+		{Start: one, StartStasis: one},
+		{Start: one, StartStasis: one.Next(), Expiration: one},
+	} {
+		if _, _, err := tc.rng.RequestLease(context.Background(), tc.store.Engine(), nil,
+			roachpb.Header{}, roachpb.RequestLeaseRequest{
+				Lease: lease,
+			}); !testutils.IsError(err, "illegal lease interval") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
 	if held, _ := hasLease(tc.rng, tc.clock.Now()); !held {
 		t.Errorf("expected lease on range start")
 	}
 	tc.manualClock.Set(leaseExpiry(tc.rng))
 	now := tc.clock.Now()
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       now.Add(10, 0),
 		StartStasis: now.Add(20, 0),
 		Expiration:  now.Add(20, 0),
@@ -605,23 +601,23 @@ func TestReplicaLeaderLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if held, expired := hasLease(tc.rng, tc.clock.Now().Add(15, 0)); held || expired {
-		t.Errorf("expected second replica to have leader lease")
+		t.Errorf("expected second replica to have range lease")
 	}
 
 	{
-		pErr := tc.rng.redirectOnOrAcquireLeaderLease(tc.rng.context(context.Background()))
-		if lErr, ok := pErr.GetDetail().(*roachpb.NotLeaderError); !ok || lErr == nil {
-			t.Fatalf("wanted NotLeaderError, got %s", pErr)
+		pErr := tc.rng.redirectOnOrAcquireLease(context.Background())
+		if lErr, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok || lErr == nil {
+			t.Fatalf("wanted NotLeaseHolderError, got %s", pErr)
 		}
 	}
 	// Advance clock past expiration and verify that another has
-	// leader lease will not be true.
+	// range lease will not be true.
 	tc.manualClock.Increment(21) // 21ns have passed
 	if held, expired := hasLease(tc.rng, tc.clock.Now()); held || !expired {
 		t.Errorf("expected another replica to have expired lease")
 	}
 
-	// Verify that command returns NotLeaderError when lease is rejected.
+	// Verify that command returns NotLeaseHolderError when lease is rejected.
 	rng, err := NewReplica(testRangeDescriptor(), tc.store, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -636,20 +632,20 @@ func TestReplicaLeaderLease(t *testing.T) {
 	rng.mu.Unlock()
 
 	{
-		if _, ok := rng.redirectOnOrAcquireLeaderLease(tc.rng.context(context.Background())).GetDetail().(*roachpb.NotLeaderError); !ok {
-			t.Fatalf("expected %T, got %s", &roachpb.NotLeaderError{}, err)
+		if _, ok := rng.redirectOnOrAcquireLease(context.Background()).GetDetail().(*roachpb.NotLeaseHolderError); !ok {
+			t.Fatalf("expected %T, got %s", &roachpb.NotLeaseHolderError{}, err)
 		}
 	}
 }
 
-// TestReplicaNotLeaderError verifies NotLeaderError when lease is rejected.
-func TestReplicaNotLeaderError(t *testing.T) {
+// TestReplicaNotLeaseHolderError verifies NotLeaderError when lease is rejected.
+func TestReplicaNotLeaseHolderError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
 
-	// Modify range descriptor to include a second replica; leader lease can
+	// Modify range descriptor to include a second replica; range lease can
 	// only be obtained by Replicas which are part of the range descriptor. This
 	// workaround is sufficient for the purpose of this test.
 	secondReplica := roachpb.ReplicaDescriptor{
@@ -663,7 +659,7 @@ func TestReplicaNotLeaderError(t *testing.T) {
 
 	tc.manualClock.Set(leaseExpiry(tc.rng))
 	now := tc.clock.Now()
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       now,
 		StartStasis: now.Add(10, 0),
 		Expiration:  now.Add(10, 0),
@@ -699,8 +695,8 @@ func TestReplicaNotLeaderError(t *testing.T) {
 	for i, test := range testCases {
 		_, pErr := tc.SendWrappedWith(roachpb.Header{Timestamp: now}, test)
 
-		if _, ok := pErr.GetDetail().(*roachpb.NotLeaderError); !ok {
-			t.Errorf("%d: expected not leader error: %s", i, pErr)
+		if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok {
+			t.Errorf("%d: expected not lease holder error: %s", i, pErr)
 		}
 	}
 }
@@ -720,11 +716,11 @@ func TestReplicaLeaseCounters(t *testing.T) {
 		}
 	}
 	metrics := tc.rng.store.metrics
-	assert(metrics.leaseRequestSuccessCount.Count(), 1, 1000)
-	assert(metrics.leaseRequestErrorCount.Count(), 0, 0)
+	assert(metrics.LeaseRequestSuccessCount.Count(), 1, 1000)
+	assert(metrics.LeaseRequestErrorCount.Count(), 0, 0)
 
 	now := tc.clock.Now()
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       now,
 		StartStasis: now.Add(10, 0),
 		Expiration:  now.Add(10, 0),
@@ -736,11 +732,11 @@ func TestReplicaLeaseCounters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	assert(metrics.leaseRequestSuccessCount.Count(), 2, 1000)
-	assert(metrics.leaseRequestErrorCount.Count(), 0, 0)
+	assert(metrics.LeaseRequestSuccessCount.Count(), 2, 1000)
+	assert(metrics.LeaseRequestErrorCount.Count(), 0, 0)
 
-	// Make setLeaderLease fail by providing an invalid ReplicaDescriptor.
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	// Make lease request fail by providing an invalid ReplicaDescriptor.
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       now,
 		StartStasis: now.Add(10, 0),
 		Expiration:  now.Add(10, 0),
@@ -750,22 +746,22 @@ func TestReplicaLeaseCounters(t *testing.T) {
 			StoreID:   99,
 		},
 	}); err == nil {
-		t.Fatal("setLeaderLease did not fail on invalid ReplicaDescriptor")
+		t.Fatal("lease request did not fail on invalid ReplicaDescriptor")
 	}
 
-	assert(metrics.leaseRequestSuccessCount.Count(), 2, 1000)
-	assert(metrics.leaseRequestErrorCount.Count(), 1, 1000)
+	assert(metrics.LeaseRequestSuccessCount.Count(), 2, 1000)
+	assert(metrics.LeaseRequestErrorCount.Count(), 1, 1000)
 }
 
 // TestReplicaGossipConfigsOnLease verifies that config info is gossiped
-// upon acquisition of the leader lease.
+// upon acquisition of the range lease.
 func TestReplicaGossipConfigsOnLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
 
-	// Modify range descriptor to include a second replica; leader lease can
+	// Modify range descriptor to include a second replica; range lease can
 	// only be obtained by Replicas which are part of the range descriptor. This
 	// workaround is sufficient for the purpose of this test.
 	secondReplica := roachpb.ReplicaDescriptor{
@@ -799,7 +795,7 @@ func TestReplicaGossipConfigsOnLease(t *testing.T) {
 	now := tc.clock.Now()
 
 	// Give lease to someone else.
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       now,
 		StartStasis: now.Add(10, 0),
 		Expiration:  now.Add(10, 0),
@@ -817,7 +813,7 @@ func TestReplicaGossipConfigsOnLease(t *testing.T) {
 	now = tc.clock.Now()
 
 	// Give lease to this range.
-	if err := setLeaderLease(tc.rng, &roachpb.Lease{
+	if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 		Start:       now.Add(11, 0),
 		StartStasis: now.Add(20, 0),
 		Expiration:  now.Add(20, 0),
@@ -847,9 +843,9 @@ func TestReplicaGossipConfigsOnLease(t *testing.T) {
 }
 
 // TestReplicaTSCacheLowWaterOnLease verifies that the low water mark
-// is set on the timestamp cache when the node is granted the leader
+// is set on the timestamp cache when the node is granted the lease holder
 // lease after not holding it and it is not set when the node is
-// granted the leader lease when it was the last holder.
+// granted the range lease when it was the last holder.
 func TestReplicaTSCacheLowWaterOnLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
@@ -857,9 +853,9 @@ func TestReplicaTSCacheLowWaterOnLease(t *testing.T) {
 	defer tc.Stop()
 	tc.clock.SetMaxOffset(maxClockOffset)
 	// Disable raft log truncation which confuses this test.
-	tc.store.DisableRaftLogQueue(true)
+	tc.store.SetRaftLogQueueActive(false)
 
-	// Modify range descriptor to include a second replica; leader lease can
+	// Modify range descriptor to include a second replica; range lease can
 	// only be obtained by Replicas which are part of the range descriptor. This
 	// workaround is sufficient for the purpose of this test.
 	secondReplica := roachpb.ReplicaDescriptor{
@@ -924,7 +920,7 @@ func TestReplicaTSCacheLowWaterOnLease(t *testing.T) {
 	}
 
 	for i, test := range testCases {
-		if err := setLeaderLease(tc.rng, &roachpb.Lease{
+		if err := sendLeaseRequest(tc.rng, &roachpb.Lease{
 			Start:       test.start,
 			StartStasis: test.expiration.Add(-1, 0), // smaller than durations used
 			Expiration:  test.expiration,
@@ -949,11 +945,11 @@ func TestReplicaTSCacheLowWaterOnLease(t *testing.T) {
 	}
 }
 
-// TestReplicaLeaderLeaseRejectUnknownRaftNodeID ensures that a replica cannot
-// obtain the leader lease if it is not part of the current range descriptor.
+// TestReplicaLeaseRejectUnknownRaftNodeID ensures that a replica cannot
+// obtain the range lease if it is not part of the current range descriptor.
 // TODO(mrtracy): This should probably be tested in client_raft_test package,
 // using a real second store.
-func TestReplicaLeaderLeaseRejectUnknownRaftNodeID(t *testing.T) {
+func TestReplicaLeaseRejectUnknownRaftNodeID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
@@ -973,8 +969,8 @@ func TestReplicaLeaderLeaseRejectUnknownRaftNodeID(t *testing.T) {
 	}
 	ba := roachpb.BatchRequest{}
 	ba.Timestamp = tc.rng.store.Clock().Now()
-	ba.Add(&roachpb.LeaderLeaseRequest{Lease: *lease})
-	ch, _, err := tc.rng.proposeRaftCommand(tc.rng.context(context.Background()), ba)
+	ba.Add(&roachpb.RequestLeaseRequest{Lease: *lease})
+	ch, _, err := tc.rng.proposeRaftCommand(context.Background(), ba)
 	if err == nil {
 		// Next if the command was committed, wait for the range to apply it.
 		// TODO(bdarnell): refactor to a more conventional error-handling pattern.
@@ -986,23 +982,23 @@ func TestReplicaLeaderLeaseRejectUnknownRaftNodeID(t *testing.T) {
 	}
 }
 
-// TestReplicaDrainLeaderLease makes sure that no new leases are granted when
-// the Store is in DrainLeadership mode.
-func TestReplicaDrainLeaderLease(t *testing.T) {
+// TestReplicaDrainLease makes sure that no new leases are granted when
+// the Store is in DrainLeases mode.
+func TestReplicaDrainLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
 
 	// Acquire initial lease.
-	if pErr := tc.rng.redirectOnOrAcquireLeaderLease(context.Background()); pErr != nil {
+	if pErr := tc.rng.redirectOnOrAcquireLease(context.Background()); pErr != nil {
 		t.Fatal(pErr)
 	}
 	var slept atomic.Value
 	slept.Store(false)
 	if err := tc.stopper.RunAsyncTask(func() {
 		// Wait just a bit so that the main thread can check that
-		// DrainLeadership blocks (false negatives are possible, but 10ms is
+		// DrainLeases blocks (false negatives are possible, but 10ms is
 		// plenty to make this fail 99.999% of the time in practice).
 		time.Sleep(10 * time.Millisecond)
 		slept.Store(true)
@@ -1011,7 +1007,7 @@ func TestReplicaDrainLeaderLease(t *testing.T) {
 			tc.manualClock.Increment(leaseExpiry(tc.rng))
 			select {
 			case <-time.After(10 * time.Millisecond): // real code would use Ticker
-			case <-tc.stopper.ShouldDrain():
+			case <-tc.stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -1019,24 +1015,24 @@ func TestReplicaDrainLeaderLease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := tc.store.DrainLeadership(true); err != nil {
+	if err := tc.store.DrainLeases(true); err != nil {
 		t.Fatal(err)
 	}
 	if !slept.Load().(bool) {
-		t.Fatal("DrainLeadership returned with active lease")
+		t.Fatal("DrainLeases returned with active lease")
 	}
 	tc.rng.mu.Lock()
 	pErr := <-tc.rng.requestLeaseLocked(tc.clock.Now())
 	tc.rng.mu.Unlock()
-	_, ok := pErr.GetDetail().(*roachpb.NotLeaderError)
+	_, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError)
 	if !ok {
-		t.Fatalf("expected NotLeaderError, not %v", pErr)
+		t.Fatalf("expected NotLeaseHolderError, not %v", pErr)
 	}
-	if err := tc.store.DrainLeadership(false); err != nil {
+	if err := tc.store.DrainLeases(false); err != nil {
 		t.Fatal(err)
 	}
 	// Newly unfrozen, leases work again.
-	if pErr := tc.rng.redirectOnOrAcquireLeaderLease(context.Background()); pErr != nil {
+	if pErr := tc.rng.redirectOnOrAcquireLease(context.Background()); pErr != nil {
 		t.Fatal(pErr)
 	}
 }
@@ -1132,7 +1128,7 @@ func TestReplicaNoGossipConfig(t *testing.T) {
 
 	for i, test := range testCases {
 		txn.Sequence++
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), test.h, test.req); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), test.h, test.req); pErr != nil {
 			t.Fatal(pErr)
 		}
 		txn.Writing = true
@@ -1148,7 +1144,7 @@ func TestReplicaNoGossipConfig(t *testing.T) {
 	}
 }
 
-// TestReplicaNoGossipFromNonLeader verifies that a non-leader replica
+// TestReplicaNoGossipFromNonLeader verifies that a non-lease holder replica
 // does not gossip configurations.
 func TestReplicaNoGossipFromNonLeader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -1181,14 +1177,17 @@ func TestReplicaNoGossipFromNonLeader(t *testing.T) {
 		t.Fatal(pErr)
 	}
 
-	// Increment the clock's timestamp to expire the leader lease.
+	// Increment the clock's timestamp to expire the range lease.
 	tc.manualClock.Set(leaseExpiry(tc.rng))
-	if lease, _ := tc.rng.getLeaderLease(); lease.Covers(tc.clock.Now()) {
-		t.Fatal("leader lease should have been expired")
+	if lease, _ := tc.rng.getLease(); lease.Covers(tc.clock.Now()) {
+		t.Fatal("range lease should have been expired")
 	}
 
-	// Make sure the information for db1 is not gossiped.
-	tc.rng.maybeGossipSystemConfig()
+	// Make sure the information for db1 is not gossiped. Since obtaining
+	// a lease updates the gossiped information, we do that.
+	if pErr := tc.rng.redirectOnOrAcquireLease(context.Background()); pErr != nil {
+		t.Fatal(pErr)
+	}
 	// Fetch the raw gossip info. GetSystemConfig is based on callbacks at
 	// modification time. But we're checking for _not_ gossiped, so there should
 	// be no callbacks. Easier to check the raw info.
@@ -1523,9 +1522,9 @@ func TestOptimizePuts(t *testing.T) {
 	}
 }
 
-// TestAcquireLeaderLease verifies that the leader lease is acquired
+// TestAcquireLease verifies that the range lease is acquired
 // for read and write methods, and eagerly renewed.
-func TestAcquireLeaderLease(t *testing.T) {
+func TestAcquireLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	gArgs := getArgs([]byte("a"))
@@ -1540,7 +1539,7 @@ func TestAcquireLeaderLease(t *testing.T) {
 		// the start of a lease as far as possible, and since there is an auto-
 		// matic lease for us at the beginning, we'll basically create a lease from
 		// then on.
-		lease, _ := tc.rng.getLeaderLease()
+		lease, _ := tc.rng.getLease()
 		expStart := lease.Start
 		tc.manualClock.Set(leaseExpiry(tc.rng))
 
@@ -1551,7 +1550,7 @@ func TestAcquireLeaderLease(t *testing.T) {
 		if held, expired := hasLease(tc.rng, ts); !held || expired {
 			t.Errorf("%d: expected lease acquisition", i)
 		}
-		lease, _ = tc.rng.getLeaderLease()
+		lease, _ = tc.rng.getLease()
 		if !lease.Start.Equal(expStart) {
 			t.Errorf("%d: unexpected lease start: %s; expected %s", i, lease.Start, expStart)
 		}
@@ -1568,7 +1567,7 @@ func TestAcquireLeaderLease(t *testing.T) {
 		// Since the command we sent above does not get blocked on the lease
 		// extension, we need to wait for it to go through.
 		util.SucceedsSoon(t, func() error {
-			newLease, _ := tc.rng.getLeaderLease()
+			newLease, _ := tc.rng.getLease()
 			if !lease.StartStasis.Less(newLease.StartStasis) {
 				return errors.Errorf("%d: lease did not get extended: %+v to %+v", i, lease, newLease)
 			}
@@ -1581,7 +1580,7 @@ func TestAcquireLeaderLease(t *testing.T) {
 	}
 }
 
-func TestLeaderLeaseConcurrent(t *testing.T) {
+func TestLeaseConcurrent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	const num = 5
 
@@ -1594,7 +1593,7 @@ func TestLeaderLeaseConcurrent(t *testing.T) {
 		}
 	}
 
-	// Testing concurrent leader lease requests is still a good idea. We check
+	// Testing concurrent range lease requests is still a good idea. We check
 	// that they work and clone *Error, which prevents regression of #6111.
 	const origMsg = "boom"
 	for _, withError := range []bool{false, true} {
@@ -1612,7 +1611,7 @@ func TestLeaderLeaseConcurrent(t *testing.T) {
 			tc.rng.mu.Lock()
 			tc.rng.mu.proposeRaftCommandFn = func(cmd *pendingCmd) error {
 				ll, ok := cmd.raftCmd.Cmd.Requests[0].
-					GetInner().(*roachpb.LeaderLeaseRequest)
+					GetInner().(*roachpb.RequestLeaseRequest)
 				if !ok || !active.Load().(bool) {
 					return defaultProposeRaftCommandLocked(tc.rng, cmd)
 				}
@@ -1620,7 +1619,7 @@ func TestLeaderLeaseConcurrent(t *testing.T) {
 					// Morally speaking, this is an error, but reproposals can
 					// happen and so we warn (in case this trips the test up
 					// in more unexpected ways).
-					log.Infof("reproposal of %+v", ll)
+					log.Infof(context.Background(), "reproposal of %+v", ll)
 				}
 				go func() {
 					wg.Wait()
@@ -1972,7 +1971,7 @@ func TestReplicaUseTSCache(t *testing.T) {
 	}
 	pArgs := putArgs([]byte("a"), []byte("value"))
 
-	_, respH, pErr := SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{}, &pArgs)
+	_, respH, pErr := SendWrapped(tc.Sender(), context.Background(), roachpb.Header{}, &pArgs)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -2004,7 +2003,7 @@ func TestReplicaNoTSCacheInconsistent(t *testing.T) {
 	}
 	pArgs := putArgs([]byte("a"), []byte("value"))
 
-	_, respH, pErr := SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{Timestamp: hlc.ZeroTimestamp.Add(0, 1)}, &pArgs)
+	_, respH, pErr := SendWrapped(tc.Sender(), context.Background(), roachpb.Header{Timestamp: hlc.ZeroTimestamp.Add(0, 1)}, &pArgs)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -2049,7 +2048,7 @@ func TestReplicaNoTSCacheUpdateOnFailure(t *testing.T) {
 
 		// Write the intent again -- should not have its timestamp upgraded!
 		txn.Sequence++
-		if _, respH, pErr := SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{Txn: txn}, &pArgs); pErr != nil {
+		if _, respH, pErr := SendWrapped(tc.Sender(), context.Background(), roachpb.Header{Txn: txn}, &pArgs); pErr != nil {
 			t.Fatalf("test %d: %s", i, pErr)
 		} else if !respH.Txn.Timestamp.Equal(txn.Timestamp) {
 			t.Errorf("expected timestamp not to advance %s != %s", respH.Timestamp, txn.Timestamp)
@@ -2083,7 +2082,7 @@ func TestReplicaNoTimestampIncrementWithinTxn(t *testing.T) {
 	pArgs := putArgs(key, []byte("value"))
 
 	txn.Sequence++
-	_, respH, pErr := SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{Txn: txn}, &pArgs)
+	_, respH, pErr := SendWrapped(tc.Sender(), context.Background(), roachpb.Header{Txn: txn}, &pArgs)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -2107,7 +2106,7 @@ func TestReplicaNoTimestampIncrementWithinTxn(t *testing.T) {
 	expTS := ts
 	expTS.Logical++
 
-	_, respH, pErr = SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{Timestamp: ts}, &pArgs)
+	_, respH, pErr = SendWrapped(tc.Sender(), context.Background(), roachpb.Header{Timestamp: ts}, &pArgs)
 	if pErr != nil {
 		t.Errorf("unexpected pError: %s", pErr)
 	}
@@ -2250,7 +2249,7 @@ func TestTransactionRetryLeavesIntents(t *testing.T) {
 	ba.Add(&btArgs)
 	ba.Add(&pArgs)
 	ba.Add(&etArgs)
-	_, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	_, pErr := tc.Sender().Send(context.Background(), ba)
 	if _, ok := pErr.GetDetail().(*roachpb.TransactionRetryError); !ok {
 		t.Fatalf("expected retry error; got %s", pErr)
 	}
@@ -2305,7 +2304,7 @@ func TestEndTransactionDeadline(t *testing.T) {
 		put := putArgs(key, key)
 
 		_, header := beginTxnArgs(key, txn)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), header, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), header, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 		txn.Writing = true
@@ -2395,7 +2394,7 @@ func TestEndTransactionWithMalformedSplitTrigger(t *testing.T) {
 	txn := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
 	pArgs := putArgs(key, []byte("only here to make this a rw transaction"))
 	txn.Sequence++
-	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), roachpb.Header{
 		Txn: txn,
 	}, &pArgs); pErr != nil {
 		t.Fatal(pErr)
@@ -2408,7 +2407,7 @@ func TestEndTransactionWithMalformedSplitTrigger(t *testing.T) {
 	// split of the default range; start key must be "" in this case.
 	args.InternalCommitTrigger = &roachpb.InternalCommitTrigger{
 		SplitTrigger: &roachpb.SplitTrigger{
-			UpdatedDesc: roachpb.RangeDescriptor{StartKey: roachpb.RKey("bar")},
+			LeftDesc: roachpb.RangeDescriptor{StartKey: roachpb.RKey("bar")},
 		},
 	}
 
@@ -2435,7 +2434,7 @@ func TestEndTransactionBeforeHeartbeat(t *testing.T) {
 		txn := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
 		_, btH := beginTxnArgs(key, txn)
 		put := putArgs(key, key)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 		txn.Sequence++
@@ -2485,7 +2484,7 @@ func TestEndTransactionAfterHeartbeat(t *testing.T) {
 		txn := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
 		_, btH := beginTxnArgs(key, txn)
 		put := putArgs(key, key)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 
@@ -2553,7 +2552,7 @@ func TestEndTransactionWithPushedTimestamp(t *testing.T) {
 		pusher.Priority = 2 // pusher will win
 		_, btH := beginTxnArgs(key, pushee)
 		put := putArgs(key, []byte("value"))
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 
@@ -2602,7 +2601,7 @@ func TestEndTransactionWithIncrementedEpoch(t *testing.T) {
 	txn := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
 	_, btH := beginTxnArgs(key, txn)
 	put := putArgs(key, key)
-	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 		t.Fatal(pErr)
 	}
 	txn.Writing = true
@@ -2688,7 +2687,7 @@ func TestEndTransactionWithErrors(t *testing.T) {
 		txn.Sequence++
 
 		if _, pErr := tc.SendWrappedWith(h, &args); !testutils.IsPError(pErr, test.expErrRegexp) {
-			t.Errorf("%d: expected error:\n%s\nto match:\n%s", i, pErr, test.expErrRegexp)
+			t.Errorf("%d: expected error:\n%s\not match:\n%s", i, pErr, test.expErrRegexp)
 		} else if txn := pErr.GetTxn(); txn != nil && txn.ID == nil {
 			// Prevent regression of #5591.
 			t.Fatalf("%d: received empty Transaction proto in error", i)
@@ -2710,7 +2709,7 @@ func TestEndTransactionRollbackAbortedTransaction(t *testing.T) {
 	txn := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
 	_, btH := beginTxnArgs(key, txn)
 	put := putArgs(key, key)
-	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -2729,7 +2728,7 @@ func TestEndTransactionRollbackAbortedTransaction(t *testing.T) {
 	if err := ba.SetActiveTimestamp(tc.clock.Now); err != nil {
 		t.Fatal(err)
 	}
-	_, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	_, pErr := tc.Sender().Send(context.Background(), ba)
 	if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); !ok {
 		t.Errorf("expected write intent error, but got %s", pErr)
 	}
@@ -2747,7 +2746,7 @@ func TestEndTransactionRollbackAbortedTransaction(t *testing.T) {
 	}
 
 	// Verify that the intent has been resolved.
-	if _, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba); pErr != nil {
+	if _, pErr := tc.Sender().Send(context.Background(), ba); pErr != nil {
 		t.Errorf("expected resolved intent, but got %s", pErr)
 	}
 }
@@ -2772,7 +2771,7 @@ func TestRaftReplayProtection(t *testing.T) {
 	{
 		// Start with an increment for key.
 		incArgs := incrementArgs(key, incs[0])
-		_, respH, pErr := SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{}, &incArgs)
+		_, respH, pErr := SendWrapped(tc.Sender(), context.Background(), roachpb.Header{}, &incArgs)
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -2781,7 +2780,7 @@ func TestRaftReplayProtection(t *testing.T) {
 		// This will bump up to a higher timestamp than the original increment
 		// and not surface a WriteTooOldError.
 		h := roachpb.Header{Timestamp: respH.Timestamp.Prev()}
-		_, respH, pErr = SendWrapped(tc.Sender(), tc.rng.context(context.Background()), h, &incArgs)
+		_, respH, pErr = SendWrapped(tc.Sender(), context.Background(), h, &incArgs)
 		if pErr != nil {
 			t.Fatalf("unexpected error: %s", respH)
 		}
@@ -2794,7 +2793,7 @@ func TestRaftReplayProtection(t *testing.T) {
 		// encountered is an exact duplicate and nothing came before the
 		// increment in the batch.
 		h.Timestamp = respH.Timestamp
-		_, _, pErr = SendWrapped(tc.Sender(), tc.rng.context(context.Background()), h, &incArgs)
+		_, _, pErr = SendWrapped(tc.Sender(), context.Background(), h, &incArgs)
 		if _, ok := pErr.GetDetail().(*roachpb.WriteTooOldError); !ok {
 			t.Fatalf("expected WriteTooOldError; got %s", pErr)
 		}
@@ -2807,7 +2806,7 @@ func TestRaftReplayProtection(t *testing.T) {
 		incArgs := incrementArgs(key, inc)
 		ba.Add(&incArgs)
 	}
-	br, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	br, pErr := tc.Sender().Send(context.Background(), ba)
 	if pErr != nil {
 		t.Fatalf("unexpected error: %s", pErr)
 	}
@@ -2819,7 +2818,7 @@ func TestRaftReplayProtection(t *testing.T) {
 	// Now resend the batch with the same timestamp; this should look
 	// like the replay it is and surface a WriteTooOldError.
 	ba.Timestamp = br.Timestamp
-	_, pErr = tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	_, pErr = tc.Sender().Send(context.Background(), ba)
 	if _, ok := pErr.GetDetail().(*roachpb.WriteTooOldError); !ok {
 		t.Fatalf("expected WriteTooOldError; got %s", pErr)
 	}
@@ -2829,7 +2828,7 @@ func TestRaftReplayProtection(t *testing.T) {
 	ba = roachpb.BatchRequest{}
 	ba.Add(roachpb.NewDeleteRange(key, key.Next(), false))
 	ba.Add(&incArgs)
-	br, pErr = tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	br, pErr = tc.Sender().Send(context.Background(), ba)
 	if pErr != nil {
 		t.Fatalf("unexpected error: %s", pErr)
 	}
@@ -2837,7 +2836,7 @@ func TestRaftReplayProtection(t *testing.T) {
 	// Send exact same batch; the DeleteRange should trip up and
 	// we'll get a replay error.
 	ba.Timestamp = br.Timestamp
-	_, pErr = tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	_, pErr = tc.Sender().Send(context.Background(), ba)
 	if _, ok := pErr.GetDetail().(*roachpb.WriteTooOldError); !ok {
 		t.Fatalf("expected WriteTooOldError; got %s", pErr)
 	}
@@ -2845,7 +2844,7 @@ func TestRaftReplayProtection(t *testing.T) {
 	// Send just a DeleteRange batch.
 	ba = roachpb.BatchRequest{}
 	ba.Add(roachpb.NewDeleteRange(key, key.Next(), false))
-	br, pErr = tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	br, pErr = tc.Sender().Send(context.Background(), ba)
 	if pErr != nil {
 		t.Fatalf("unexpected error: %s", pErr)
 	}
@@ -2854,7 +2853,7 @@ func TestRaftReplayProtection(t *testing.T) {
 	// previous DeleteRange didn't leave any tombstones at this
 	// timestamp for the replay to "trip" over.
 	ba.Timestamp = br.Timestamp
-	_, pErr = tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	_, pErr = tc.Sender().Send(context.Background(), ba)
 	if pErr != nil {
 		t.Fatalf("unexpected error: %s", pErr)
 	}
@@ -2883,7 +2882,7 @@ func TestRaftReplayProtectionInTxn(t *testing.T) {
 	ba.Add(&bt)
 	ba.Add(&put)
 	ba.Add(&et)
-	_, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	_, pErr := tc.Sender().Send(context.Background(), ba)
 	if pErr != nil {
 		t.Fatalf("unexpected error: %s", pErr)
 	}
@@ -2892,7 +2891,7 @@ func TestRaftReplayProtectionInTxn(t *testing.T) {
 		// Reach in and manually send to raft (to simulate Raft replay) and
 		// also avoid updating the timestamp cache; verify WriteTooOldError.
 		ba.Timestamp = txn.OrigTimestamp
-		ch, _, err := tc.rng.proposeRaftCommand(tc.rng.context(context.Background()), ba)
+		ch, _, err := tc.rng.proposeRaftCommand(context.Background(), ba)
 		if err != nil {
 			t.Fatalf("%d: unexpected error: %s", i, err)
 		}
@@ -2920,7 +2919,7 @@ func TestReplicaLaziness(t *testing.T) {
 		var ba roachpb.BatchRequest
 		request := action()
 		ba.Add(request)
-		if _, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba); pErr != nil {
+		if _, pErr := tc.Sender().Send(context.Background(), ba); pErr != nil {
 			t.Fatalf("unexpected error: %s", pErr)
 		}
 
@@ -2970,7 +2969,7 @@ func TestReplayProtection(t *testing.T) {
 		if err := ba.SetActiveTimestamp(tc.clock.Now); err != nil {
 			t.Fatal(err)
 		}
-		br, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba)
+		br, pErr := tc.Sender().Send(context.Background(), ba)
 		if pErr != nil {
 			t.Fatalf("%d: unexpected error: %s", i, pErr)
 		}
@@ -2979,7 +2978,7 @@ func TestReplayProtection(t *testing.T) {
 		putB := putArgs(keyB, []byte("value"))
 		putTxn := br.Txn.Clone()
 		putTxn.Sequence++
-		_, respH, pErr := SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{Txn: &putTxn}, &putB)
+		_, respH, pErr := SendWrapped(tc.Sender(), context.Background(), roachpb.Header{Txn: &putTxn}, &putB)
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -3002,7 +3001,7 @@ func TestReplayProtection(t *testing.T) {
 		}
 
 		// Now replay begin & put. BeginTransaction should fail with a replay error.
-		_, pErr = tc.Sender().Send(tc.rng.context(context.Background()), ba)
+		_, pErr = tc.Sender().Send(context.Background(), ba)
 		if _, ok := pErr.GetDetail().(*roachpb.TransactionReplayError); !ok {
 			t.Errorf("%d: expected transaction replay for iso=%s; got %s", i, iso, pErr)
 		}
@@ -3015,7 +3014,7 @@ func TestReplayProtection(t *testing.T) {
 
 		// Send a put for keyB; should fail with a WriteTooOldError as this
 		// will look like an obvious replay.
-		_, _, pErr = SendWrapped(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{Txn: &putTxn}, &putB)
+		_, _, pErr = SendWrapped(tc.Sender(), context.Background(), roachpb.Header{Txn: &putTxn}, &putB)
 		if _, ok := pErr.GetDetail().(*roachpb.WriteTooOldError); !ok {
 			t.Errorf("%d: expected write too old error for iso=%s; got %s", i, iso, pErr)
 		}
@@ -3075,7 +3074,7 @@ func TestEndTransactionLocalGC(t *testing.T) {
 		txn := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
 		_, btH := beginTxnArgs(key, txn)
 		put := putArgs(putKey, key)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 		putKey = putKey.Next() // for the next iteration
@@ -3110,7 +3109,7 @@ func setupResolutionTest(t *testing.T, tc testContext, key roachpb.Key,
 	txn.Epoch++
 	pArgs := putArgs(key, []byte("value"))
 	h := roachpb.Header{Txn: txn}
-	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), h, &pArgs); pErr != nil {
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), h, &pArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -3123,7 +3122,7 @@ func setupResolutionTest(t *testing.T, tc testContext, key roachpb.Key,
 		pArgs := putArgs(splitKey.AsRawKey(), []byte("value"))
 		ba.Add(&pArgs)
 		txn.Sequence++
-		if _, pErr := newRng.Send(newRng.context(context.Background()), ba); pErr != nil {
+		if _, pErr := newRng.Send(context.Background(), ba); pErr != nil {
 			t.Fatal(pErr)
 		}
 	}
@@ -3168,7 +3167,7 @@ func TestEndTransactionResolveOnlyLocalIntents(t *testing.T) {
 		if err := ba.SetActiveTimestamp(tc.clock.Now); err != nil {
 			t.Fatal(err)
 		}
-		_, pErr := newRng.Send(newRng.context(context.Background()), ba)
+		_, pErr := newRng.Send(context.Background(), ba)
 		if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); !ok {
 			t.Errorf("expected write intent error, but got %s", pErr)
 		}
@@ -3324,7 +3323,7 @@ func TestReplicaResolveIntentNoWait(t *testing.T) {
 	setupResolutionTest(t, tc, roachpb.Key("a") /* irrelevant */, splitKey, true /* commit */)
 	txn := newTransaction("name", key, 1, enginepb.SERIALIZABLE, tc.clock)
 	txn.Status = roachpb.COMMITTED
-	if pErr := tc.store.intentResolver.resolveIntents(context.Background(), tc.rng,
+	if pErr := tc.store.intentResolver.resolveIntents(context.Background(),
 		[]roachpb.Intent{{
 			Span:   roachpb.Span{Key: key},
 			Txn:    txn.TxnMeta,
@@ -3516,7 +3515,7 @@ func TestPushTxnAlreadyCommittedOrAborted(t *testing.T) {
 		// Begin the pushee's transaction.
 		_, btH := beginTxnArgs(key, pushee)
 		put := putArgs(key, key)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 		// End the pushee's transaction.
@@ -3576,7 +3575,7 @@ func TestPushTxnUpgradeExistingTxn(t *testing.T) {
 		pushee.LastHeartbeat = &test.startTS
 		_, btH := beginTxnArgs(key, pushee)
 		put := putArgs(key, key)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 
@@ -3661,7 +3660,7 @@ func TestPushTxnHeartbeatTimeout(t *testing.T) {
 		_, btH := beginTxnArgs(key, pushee)
 		btH.Timestamp = tc.rng.store.Clock().Now()
 		put := putArgs(key, key)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatalf("%d: %s", i, pErr)
 		}
 
@@ -3796,7 +3795,7 @@ func TestPushTxnPriorities(t *testing.T) {
 
 		_, btH := beginTxnArgs(key, pushee)
 		put := putArgs(key, key)
-		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 			t.Fatal(pErr)
 		}
 		// Now, attempt to push the transaction with intent epoch set appropriately.
@@ -3835,7 +3834,7 @@ func TestPushTxnPushTimestamp(t *testing.T) {
 	key := roachpb.Key("a")
 	_, btH := beginTxnArgs(key, pushee)
 	put := putArgs(key, key)
-	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 		t.Fatal(pErr)
 	}
 	pushee.Writing = true
@@ -3878,7 +3877,7 @@ func TestPushTxnPushTimestampAlreadyPushed(t *testing.T) {
 	key := roachpb.Key("a")
 	_, btH := beginTxnArgs(key, pushee)
 	put := putArgs(key, key)
-	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -3926,7 +3925,7 @@ func TestPushTxnSerializableRestart(t *testing.T) {
 	// Begin the pushee's transaction & write to key.
 	btArgs, btH := beginTxnArgs(key, pushee)
 	put := putArgs(key, []byte("foo"))
-	resp, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put)
+	resp, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -3957,7 +3956,7 @@ func TestPushTxnSerializableRestart(t *testing.T) {
 	ba.Add(&btArgs)
 	ba.Add(&put)
 	ba.Add(&etArgs)
-	_, pErr = tc.Sender().Send(tc.rng.context(context.Background()), ba)
+	_, pErr = tc.Sender().Send(context.Background(), ba)
 	if _, ok := pErr.GetDetail().(*roachpb.TransactionRetryError); !ok {
 		t.Fatalf("expected retry error; got %s", pErr)
 	}
@@ -4038,7 +4037,7 @@ func TestReplicaStatsComputation(t *testing.T) {
 	defer tc.Stop()
 
 	baseStats := initialStats()
-	// Add in the contribution for the leader lease request.
+	// Add in the contribution for the range lease request.
 	baseStats.Add(enginepb.MVCCStats{
 		SysCount: 1,
 		SysBytes: 62,
@@ -4203,7 +4202,7 @@ func TestTruncateLog(t *testing.T) {
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
-	tc.rng.store.DisableRaftLogQueue(true)
+	tc.rng.store.SetRaftLogQueueActive(false)
 
 	// Populate the log with 10 entries. Save the LastIndex after each write.
 	var indexes []uint64
@@ -4408,7 +4407,7 @@ func TestReplicaCorruption(t *testing.T) {
 	tsc.TestingKnobs.TestingCommandFilter =
 		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 			if filterArgs.Req.Header().Key.Equal(roachpb.Key("boom")) {
-				return roachpb.NewError(newReplicaCorruptionError())
+				return roachpb.NewError(NewReplicaCorruptionError(errors.New("boom")))
 			}
 			return nil
 		}
@@ -4423,11 +4422,34 @@ func TestReplicaCorruption(t *testing.T) {
 		t.Fatal(pErr)
 	}
 
+	key := roachpb.Key("boom")
+
 	// maybeSetCorrupt should have been called.
-	args = putArgs(roachpb.Key("boom"), []byte("value"))
+	args = putArgs(key, []byte("value"))
 	_, pErr := tc.SendWrapped(&args)
 	if !testutils.IsPError(pErr, "replica corruption \\(processed=true\\)") {
 		t.Fatalf("unexpected error: %s", pErr)
+	}
+
+	// Verify replica destroyed was set.
+	rkey, err := keys.Addr(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := tc.store.LookupReplica(rkey, rkey)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.mu.destroyed.Error() != pErr.GetDetail().Error() {
+		t.Fatalf("expected r.mu.destroyed == pErr.GetDetail(), instead %q != %q", r.mu.destroyed, pErr.GetDetail())
+	}
+
+	// Verify destroyed error was persisted.
+	pErr, err = loadReplicaDestroyedError(context.Background(), r.store.Engine(), r.RangeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.mu.destroyed.Error() != pErr.GetDetail().Error() {
+		t.Fatalf("expected r.mu.destroyed == pErr.GetDetail(), instead %q != %q", r.mu.destroyed, pErr.GetDetail())
 	}
 
 	// TODO(bdarnell): when maybeSetCorrupt is finished verify that future commands fail too.
@@ -4441,13 +4463,16 @@ func TestChangeReplicasDuplicateError(t *testing.T) {
 	tc.Start(t)
 	defer tc.Stop()
 
-	if err := tc.rng.ChangeReplicas(roachpb.ADD_REPLICA, roachpb.ReplicaDescriptor{
-		NodeID:  tc.store.Ident.NodeID,
-		StoreID: 9999,
-	}, tc.rng.Desc()); err == nil || !strings.Contains(err.Error(),
-		"already present") {
-		t.Fatalf("must not be able to add second replica to same node (err=%s)",
-			err)
+	if err := tc.rng.ChangeReplicas(
+		context.Background(),
+		roachpb.ADD_REPLICA,
+		roachpb.ReplicaDescriptor{
+			NodeID:  tc.store.Ident.NodeID,
+			StoreID: 9999,
+		},
+		tc.rng.Desc(),
+	); err == nil || !strings.Contains(err.Error(), "already present") {
+		t.Fatalf("must not be able to add second replica to same node (err=%s)", err)
 	}
 }
 
@@ -4514,7 +4539,7 @@ func testRangeDanglingMetaIntent(t *testing.T, isReverse bool) {
 	// priority).
 	pArgs := putArgs(keys.RangeMetaKey(roachpb.RKey(key)), data)
 	txn.Sequence++
-	if _, pErr = maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), roachpb.Header{Txn: txn}, &pArgs); pErr != nil {
+	if _, pErr = maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), roachpb.Header{Txn: txn}, &pArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -4701,14 +4726,6 @@ func TestReplicaLookup(t *testing.T) {
 	tc.Start(t)
 	defer tc.Stop()
 
-	mustAddr := func(k roachpb.Key) roachpb.RKey {
-		rk, err := keys.Addr(k)
-		if err != nil {
-			panic(err)
-		}
-		return rk
-	}
-
 	expected := []roachpb.RangeDescriptor{*tc.rng.Desc()}
 	testCases := []struct {
 		key      roachpb.RKey
@@ -4723,10 +4740,10 @@ func TestReplicaLookup(t *testing.T) {
 		{key: roachpb.RKeyMin, reverse: false, expected: expected},
 		// Test with the last key in a meta prefix. This is an edge case in the
 		// implementation.
-		{key: mustAddr(keys.Meta1KeyMax), reverse: false, expected: expected},
-		{key: mustAddr(keys.Meta2KeyMax), reverse: false, expected: nil},
-		{key: mustAddr(keys.Meta1KeyMax), reverse: true, expected: expected},
-		{key: mustAddr(keys.Meta2KeyMax), reverse: true, expected: expected},
+		{key: keys.MustAddr(keys.Meta1KeyMax), reverse: false, expected: expected},
+		{key: keys.MustAddr(keys.Meta2KeyMax), reverse: false, expected: nil},
+		{key: keys.MustAddr(keys.Meta1KeyMax), reverse: true, expected: expected},
+		{key: keys.MustAddr(keys.Meta2KeyMax), reverse: true, expected: expected},
 	}
 
 	for _, c := range testCases {
@@ -4750,13 +4767,11 @@ func TestReplicaLookup(t *testing.T) {
 	}
 }
 
-// TestRequestLeaderEncounterGroupDeleteError verifies that a request leader proposal which fails with
+// TestRequestLeaderEncounterGroupDeleteError verifies that a lease request which fails with
 // RaftGroupDeletedError is converted to a RangeNotFoundError in the Store.
 func TestRequestLeaderEncounterGroupDeleteError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	tc := testContext{
-		rng: &Replica{},
-	}
+	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
 
@@ -4764,18 +4779,12 @@ func TestRequestLeaderEncounterGroupDeleteError(t *testing.T) {
 	proposeRaftCommandFn := func(*pendingCmd) error {
 		return &roachpb.RaftGroupDeletedError{}
 	}
-	rng, err := NewReplica(testRangeDescriptor(), tc.store, 0)
+
+	rng := tc.rng
 
 	rng.mu.Lock()
 	rng.mu.proposeRaftCommandFn = proposeRaftCommandFn
 	rng.mu.Unlock()
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tc.store.AddReplicaTest(rng); err != nil {
-		t.Fatal(err)
-	}
 
 	gArgs := getArgs(roachpb.Key("a"))
 	// Force the read command request a new lease.
@@ -4865,12 +4874,13 @@ func TestBatchErrorWithIndex(t *testing.T) {
 	defer tc.Stop()
 
 	ba := roachpb.BatchRequest{}
+	// This one succeeds.
 	ba.Add(&roachpb.PutRequest{
 		Span:  roachpb.Span{Key: roachpb.Key("k")},
 		Value: roachpb.MakeValueFromString("not nil"),
 	})
-	// This one fails with a ConditionalPutError, which implements
-	// roachpb.IndexedError.
+	// This one fails with a ConditionalPutError, which will populate the
+	// returned error's index.
 	ba.Add(&roachpb.ConditionalPutRequest{
 		Span:     roachpb.Span{Key: roachpb.Key("k")},
 		Value:    roachpb.MakeValueFromString("irrelevant"),
@@ -4881,12 +4891,11 @@ func TestBatchErrorWithIndex(t *testing.T) {
 		Span: roachpb.Span{Key: roachpb.Key("k")},
 	})
 
-	if _, pErr := tc.Sender().Send(tc.rng.context(context.Background()), ba); pErr == nil {
+	if _, pErr := tc.Sender().Send(context.Background(), ba); pErr == nil {
 		t.Fatal("expected an error")
 	} else if pErr.Index == nil || pErr.Index.Index != 1 || !testutils.IsPError(pErr, "unexpected value") {
 		t.Fatalf("invalid index or error type: %s", pErr)
 	}
-
 }
 
 // TestReplicaLoadSystemConfigSpanIntent verifies that intents on the SystemConfigSpan
@@ -4911,7 +4920,7 @@ func TestReplicaLoadSystemConfigSpanIntent(t *testing.T) {
 	_, btH := beginTxnArgs(key, newTransaction("test", key, 1, enginepb.SERIALIZABLE, rng.store.Clock()))
 	btH.Txn.Priority = 1 // low so it can be pushed
 	put := putArgs(key, []byte("foo"))
-	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), context.Background(), btH, &put); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -4962,12 +4971,17 @@ func TestReplicaDestroy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// First try and fail with an outdated descriptor.
+	// First try and fail with a stale descriptor.
 	origDesc := rep.Desc()
 	newDesc := protoutil.Clone(origDesc).(*roachpb.RangeDescriptor)
-	_, newRep := newDesc.FindReplica(tc.store.StoreID())
-	newRep.ReplicaID++
-	newDesc.NextReplicaID++
+	for i := range newDesc.Replicas {
+		if newDesc.Replicas[i].StoreID == tc.store.StoreID() {
+			newDesc.Replicas[i].ReplicaID++
+			newDesc.NextReplicaID++
+			break
+		}
+	}
+
 	if err := rep.setDesc(newDesc); err != nil {
 		t.Fatal(err)
 	}
@@ -4986,7 +5000,7 @@ func TestEntries(t *testing.T) {
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
-	tc.rng.store.DisableRaftLogQueue(true)
+	tc.rng.store.SetRaftLogQueueActive(false)
 
 	// Populate the log with 10 entries. Save the LastIndex after each write.
 	var indexes []uint64
@@ -5064,7 +5078,7 @@ func TestEntries(t *testing.T) {
 			continue
 		}
 		if len(ents) != tc.expResultCount {
-			t.Errorf("%d: expected %d entires, got %d", i, tc.expResultCount, len(ents))
+			t.Errorf("%d: expected %d entries, got %d", i, tc.expResultCount, len(ents))
 		}
 	}
 
@@ -5107,7 +5121,7 @@ func TestTerm(t *testing.T) {
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
-	tc.rng.store.DisableRaftLogQueue(true)
+	tc.rng.store.SetRaftLogQueueActive(false)
 
 	rng := tc.rng
 	rangeID := rng.RangeID
@@ -5141,7 +5155,7 @@ func TestTerm(t *testing.T) {
 		t.Fatal(err)
 	}
 	if firstIndex != indexes[5] {
-		t.Fatalf("expected fristIndex %d to be %d", firstIndex, indexes[4])
+		t.Fatalf("expected firstIndex %d to be %d", firstIndex, indexes[4])
 	}
 
 	// Truncated logs should return an ErrCompacted error.
@@ -5205,10 +5219,10 @@ func TestGCIncorrectRange(t *testing.T) {
 	ts2 := makeTS(2, 0)
 	ts1Header := roachpb.Header{Timestamp: ts1}
 	ts2Header := roachpb.Header{Timestamp: ts2}
-	if _, pErr := client.SendWrappedWith(rng2, rng2.context(context.Background()), ts1Header, &putReq); pErr != nil {
+	if _, pErr := client.SendWrappedWith(rng2, context.Background(), ts1Header, &putReq); pErr != nil {
 		t.Errorf("unexpected pError on put key request: %s", pErr)
 	}
-	if _, pErr := client.SendWrappedWith(rng2, rng2.context(context.Background()), ts2Header, &putReq); pErr != nil {
+	if _, pErr := client.SendWrappedWith(rng2, context.Background(), ts2Header, &putReq); pErr != nil {
 		t.Errorf("unexpected pError on put key request: %s", pErr)
 	}
 
@@ -5217,13 +5231,13 @@ func TestGCIncorrectRange(t *testing.T) {
 	// the request for the incorrect key will be silently dropped.
 	gKey := gcKey(key, ts1)
 	gcReq := gcArgs(rng1.Desc().StartKey, rng1.Desc().EndKey, gKey)
-	if _, pErr := client.SendWrappedWith(rng1, rng1.context(context.Background()), roachpb.Header{Timestamp: tc.clock.Now()}, &gcReq); pErr != nil {
+	if _, pErr := client.SendWrappedWith(rng1, context.Background(), roachpb.Header{Timestamp: tc.clock.Now()}, &gcReq); pErr != nil {
 		t.Errorf("unexpected pError on garbage collection request to incorrect range: %s", pErr)
 	}
 
 	// Make sure the key still exists on range 2.
 	getReq := getArgs(key)
-	if res, pErr := client.SendWrappedWith(rng2, rng2.context(context.Background()), ts1Header, &getReq); pErr != nil {
+	if res, pErr := client.SendWrappedWith(rng2, context.Background(), ts1Header, &getReq); pErr != nil {
 		t.Errorf("unexpected pError on get request to correct range: %s", pErr)
 	} else if resVal := res.(*roachpb.GetResponse).Value; resVal == nil {
 		t.Errorf("expected value %s to exists after GC to incorrect range but before GC to correct range, found %v", val, resVal)
@@ -5231,12 +5245,12 @@ func TestGCIncorrectRange(t *testing.T) {
 
 	// Send GC request to range 2 for the same key.
 	gcReq = gcArgs(rng2.Desc().StartKey, rng2.Desc().EndKey, gKey)
-	if _, pErr := client.SendWrappedWith(rng2, rng2.context(context.Background()), roachpb.Header{Timestamp: tc.clock.Now()}, &gcReq); pErr != nil {
+	if _, pErr := client.SendWrappedWith(rng2, context.Background(), roachpb.Header{Timestamp: tc.clock.Now()}, &gcReq); pErr != nil {
 		t.Errorf("unexpected pError on garbage collection request to correct range: %s", pErr)
 	}
 
 	// Make sure the key no longer exists on range 2.
-	if res, pErr := client.SendWrappedWith(rng2, rng2.context(context.Background()), ts1Header, &getReq); pErr != nil {
+	if res, pErr := client.SendWrappedWith(rng2, context.Background(), ts1Header, &getReq); pErr != nil {
 		t.Errorf("unexpected pError on get request to correct range: %s", pErr)
 	} else if resVal := res.(*roachpb.GetResponse).Value; resVal != nil {
 		t.Errorf("expected value at key %s to no longer exist after GC to correct range, found value %v", key, resVal)
@@ -5244,7 +5258,7 @@ func TestGCIncorrectRange(t *testing.T) {
 }
 
 // TestReplicaCancelRaft checks that it is possible to safely abandon Raft
-// commands via a canceable context.Context.
+// commands via a cancelable context.Context.
 func TestReplicaCancelRaft(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	for _, cancelEarly := range []bool{true, false} {
@@ -5282,7 +5296,7 @@ func TestReplicaCancelRaft(t *testing.T) {
 			if err := ba.SetActiveTimestamp(tc.clock.Now); err != nil {
 				t.Fatal(err)
 			}
-			br, pErr := tc.rng.addWriteCmd(ctx, ba, nil /* wg */)
+			br, pErr := tc.rng.addWriteCmd(ctx, ba)
 			if pErr == nil {
 				if !cancelEarly {
 					// We cancelled the context while the command was already
@@ -5301,36 +5315,33 @@ func TestReplicaCancelRaft(t *testing.T) {
 	}
 }
 
-// verify the checksum for the range and returrn it.
+// verify the checksum for the range and return it.
 func verifyChecksum(t *testing.T, rng *Replica) []byte {
+	ctx := context.Background()
 	id := uuid.MakeV4()
-	args := roachpb.ComputeChecksumRequest{
+	rng.computeChecksumTrigger(ctx, roachpb.ComputeChecksumRequest{
 		ChecksumID: id,
 		Version:    replicaChecksumVersion,
-	}
-	_, err := rng.ComputeChecksum(context.Background(), nil, nil, roachpb.Header{}, args)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, ok := rng.getChecksum(id)
+	})
+	c, ok := rng.getChecksum(ctx, id)
 	if !ok {
 		t.Fatalf("checksum for id = %v not found", id)
 	}
 	if c.checksum == nil {
 		t.Fatal("couldn't compute checksum")
 	}
-	verifyArgs := roachpb.VerifyChecksumRequest{
-		ChecksumID: id,
-		Version:    replicaChecksumVersion,
-		Checksum:   c.checksum,
-	}
-	_, err = rng.VerifyChecksum(context.Background(), nil, nil, roachpb.Header{}, verifyArgs)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rng.verifyChecksumTrigger(
+		ctx,
+		roachpb.VerifyChecksumRequest{
+			ChecksumID: id,
+			Version:    replicaChecksumVersion,
+			Checksum:   c.checksum,
+		})
 	return c.checksum
 }
 
+// TODO(tschottdorf): this test is really frail and unidiomatic. Consider
+// some better high-level check of this functionality.
 func TestComputeVerifyChecksum(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
@@ -5338,111 +5349,168 @@ func TestComputeVerifyChecksum(t *testing.T) {
 	defer tc.Stop()
 	rng := tc.rng
 
-	incArgs := incrementArgs([]byte("a"), 23)
-	if _, err := tc.SendWrapped(&incArgs); err != nil {
-		t.Fatal(err)
-	}
-	initialChecksum := verifyChecksum(t, rng)
-
-	// Getting a value will not affect the snapshot checksum
-	gArgs := getArgs(roachpb.Key("a"))
-	if _, err := tc.SendWrapped(&gArgs); err != nil {
-		t.Fatal(err)
-	}
-	checksum := verifyChecksum(t, rng)
-
-	if !bytes.Equal(initialChecksum, checksum) {
-		t.Fatalf("changed checksum: e = %v, c = %v", initialChecksum, checksum)
+	key := roachpb.Key("a")
+	{
+		incArgs := incrementArgs(key, 23)
+		if _, err := tc.SendWrapped(&incArgs); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// Modifying the range will change the checksum.
-	incArgs = incrementArgs([]byte("a"), 5)
-	if _, err := tc.SendWrapped(&incArgs); err != nil {
-		t.Fatal(err)
+	// We use this helper below to gauge whether another Raft command possibly
+	// snuck in (in which case we recompute). We can't use the in-memory state
+	// because it's not updated atomically with the batch and because this
+	// test doesn't respect Raft ordering.
+	getAppliedIndex := func() uint64 {
+		rng.mu.Lock()
+		defer rng.mu.Unlock()
+
+		appliedIndex, _, err := loadAppliedIndex(context.Background(), rng.store.Engine(), rng.RangeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return appliedIndex
 	}
-	checksum = verifyChecksum(t, rng)
-	if bytes.Equal(initialChecksum, checksum) {
-		t.Fatalf("same checksum: e = %v, c = %v", initialChecksum, checksum)
-	}
+
+	// The following part of the test is inherently racy if other Raft commands
+	// get processed (which could happen due to reproposals). The loop makes
+	// sure that we catch this.
+	util.SucceedsSoon(t, func() error {
+		oldAppliedIndex := getAppliedIndex()
+		initialChecksum := verifyChecksum(t, rng)
+
+		// Getting a value will not affect the snapshot checksum.
+		gArgs := getArgs(roachpb.Key("a"))
+		if _, err := tc.SendWrapped(&gArgs); err != nil {
+			t.Fatal(err)
+		}
+		checksum := verifyChecksum(t, rng)
+
+		appliedIndex := getAppliedIndex()
+		if appliedIndex != oldAppliedIndex {
+			return errors.Errorf("applied index changed from %d to %d",
+				oldAppliedIndex, appliedIndex)
+		}
+
+		if !bytes.Equal(initialChecksum, checksum) {
+			t.Fatalf("changed checksum: e = %v, c = %v", initialChecksum, checksum)
+		}
+		return nil
+	})
+
+	util.SucceedsSoon(t, func() error {
+		oldAppliedIndex := getAppliedIndex()
+		initialChecksum := verifyChecksum(t, rng)
+
+		// Modifying the range will change the checksum.
+		incArgs := incrementArgs(key, 5)
+		if _, err := tc.SendWrapped(&incArgs); err != nil {
+			t.Fatal(err)
+		}
+		checksum := verifyChecksum(t, rng)
+
+		appliedIndex := getAppliedIndex()
+		if diff := appliedIndex - oldAppliedIndex; diff != 1 {
+			return errors.Errorf("applied index changed by %d, from %d to %d",
+				diff, oldAppliedIndex, appliedIndex)
+		}
+
+		if bytes.Equal(initialChecksum, checksum) {
+			t.Fatalf("same checksum: e = %v, c = %v", initialChecksum, checksum)
+		}
+		return nil
+	})
 
 	// Verify that a bad version/checksum sent will result in an error.
-	id := uuid.MakeV4()
-	args := roachpb.ComputeChecksumRequest{
-		ChecksumID: id,
-		Version:    replicaChecksumVersion,
-	}
-	_, err := rng.ComputeChecksum(context.Background(), nil, nil, roachpb.Header{}, args)
-	if err != nil {
-		t.Fatal(err)
-	}
+	id1 := uuid.MakeV4()
+	rng.computeChecksumTrigger(
+		context.Background(),
+		roachpb.ComputeChecksumRequest{
+			ChecksumID: id1,
+			Version:    replicaChecksumVersion,
+		})
 	// Set a callback for checksum mismatch panics.
-	var panicked bool
-	rng.store.ctx.TestingKnobs.BadChecksumPanic = func(diff []ReplicaSnapshotDiff) { panicked = true }
+	badChecksumChan := make(chan []ReplicaSnapshotDiff, 1)
+	rng.store.ctx.TestingKnobs.BadChecksumPanic = func(diff []ReplicaSnapshotDiff) {
+		badChecksumChan <- diff
+	}
 
 	// First test that sending a Verification request with a bad version and
 	// bad checksum will return without panicking because of a bad checksum.
-	verifyArgs := roachpb.VerifyChecksumRequest{
-		ChecksumID: id,
-		Version:    10000001,
-		Checksum:   []byte("bad checksum"),
-	}
-	_, err = rng.VerifyChecksum(context.Background(), nil, nil, roachpb.Header{}, verifyArgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if panicked {
-		t.Fatal("VerifyChecksum panicked")
+	rng.verifyChecksumTrigger(
+		context.Background(),
+		roachpb.VerifyChecksumRequest{
+			ChecksumID: id1,
+			Version:    10000001,
+			Checksum:   []byte("bad checksum"),
+		})
+	select {
+	case badChecksum := <-badChecksumChan:
+		t.Fatalf("bad checksum: %v", badChecksum)
+	default:
 	}
 	// Setting the correct version will verify the checksum see a
 	// checksum mismatch and trigger a rerun of the consistency check,
 	// but the second consistency check will succeed because the checksum
 	// provided in the second consistency check is the correct one.
-	verifyArgs.Version = replicaChecksumVersion
-	_, err = rng.VerifyChecksum(context.Background(), nil, nil, roachpb.Header{}, verifyArgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if panicked {
-		t.Fatal("VerifyChecksum panicked")
+	rng.verifyChecksumTrigger(
+		context.Background(),
+		roachpb.VerifyChecksumRequest{
+			ChecksumID: id1,
+			Version:    replicaChecksumVersion,
+			Checksum:   []byte("bad checksum"),
+		})
+	select {
+	case badChecksum := <-badChecksumChan:
+		t.Fatalf("bad checksum: %v", badChecksum)
+	default:
 	}
 
 	// Repeat the same but provide a snapshot this time. This will
 	// result in the checksum failure not running the second consistency
 	// check; it will panic.
-	verifyArgs.Snapshot = &roachpb.RaftSnapshotData{}
-	_, err = rng.VerifyChecksum(context.Background(), nil, nil, roachpb.Header{}, verifyArgs)
-	if err != nil {
-		t.Fatal(err)
+	rng.verifyChecksumTrigger(
+		context.Background(),
+		roachpb.VerifyChecksumRequest{
+			ChecksumID: id1,
+			Version:    replicaChecksumVersion,
+			Checksum:   []byte("bad checksum"),
+			Snapshot:   &roachpb.RaftSnapshotData{},
+		})
+	select {
+	case <-badChecksumChan:
+	default:
+		t.Fatal("expected bad checksum, but did not get one")
 	}
-	if !panicked {
-		t.Fatal("VerifyChecksum didn't panic")
-	}
-	panicked = false
 
-	id = uuid.MakeV4()
-	// send a ComputeChecksum with a bad version doesn't result in a
+	id2 := uuid.MakeV4()
+	// Sending a ComputeChecksum with a bad version doesn't result in a
 	// computed checksum.
-	args = roachpb.ComputeChecksumRequest{
-		ChecksumID: id,
-		Version:    23343434,
-	}
-	_, err = rng.ComputeChecksum(context.Background(), nil, nil, roachpb.Header{}, args)
-	if err != nil {
+	if _, _, err := rng.ComputeChecksum(
+		context.Background(),
+		nil,
+		nil,
+		roachpb.Header{},
+		roachpb.ComputeChecksumRequest{
+			ChecksumID: id2,
+			Version:    23343434,
+		},
+	); err != nil {
 		t.Fatal(err)
 	}
 	// Sending a VerifyChecksum with a bad checksum is a noop.
-	verifyArgs = roachpb.VerifyChecksumRequest{
-		ChecksumID: id,
-		Version:    replicaChecksumVersion,
-		Checksum:   []byte("bad checksum"),
-		Snapshot:   &roachpb.RaftSnapshotData{},
-	}
-	_, err = rng.VerifyChecksum(context.Background(), nil, nil, roachpb.Header{}, verifyArgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if panicked {
-		t.Fatal("VerifyChecksum panicked")
+	rng.verifyChecksumTrigger(
+		context.Background(),
+		roachpb.VerifyChecksumRequest{
+			ChecksumID: id2,
+			Version:    replicaChecksumVersion,
+			Checksum:   []byte("bad checksum"),
+			Snapshot:   &roachpb.RaftSnapshotData{},
+		})
+	select {
+	case badChecksum := <-badChecksumChan:
+		t.Fatalf("bad checksum: %v", badChecksum)
+	default:
 	}
 }
 
@@ -5452,8 +5520,9 @@ func TestNewReplicaCorruptionError(t *testing.T) {
 		errStruct *roachpb.ReplicaCorruptionError
 		expErr    string
 	}{
-		{newReplicaCorruptionError(errors.New("foo"), nil, errors.New("bar"), nil), "replica corruption (processed=false): foo (caused by bar)"},
-		{newReplicaCorruptionError(nil, nil, nil), "replica corruption (processed=false)"},
+		{NewReplicaCorruptionError(errors.New("")), "replica corruption (processed=false)"},
+		{NewReplicaCorruptionError(errors.New("foo")), "replica corruption (processed=false): foo"},
+		{NewReplicaCorruptionError(errors.Wrap(errors.New("bar"), "foo")), "replica corruption (processed=false): foo: bar"},
 	} {
 		// This uses fmt.Sprint because that ends up calling Error() and is the
 		// intended use. A previous version of this test called String() directly
@@ -5510,16 +5579,16 @@ func TestDiffRange(t *testing.T) {
 
 	// The expected diff.
 	eDiff := []ReplicaSnapshotDiff{
-		{Leader: true, Key: []byte("a"), Timestamp: timestamp, Value: value},
-		{Leader: false, Key: []byte("ab"), Timestamp: timestamp, Value: value},
-		{Leader: true, Key: []byte("abcd"), Timestamp: timestamp, Value: value},
-		{Leader: false, Key: []byte("abcdef"), Timestamp: timestamp, Value: value},
-		{Leader: false, Key: []byte("abcdefg"), Timestamp: timestamp.Add(0, 1), Value: value},
-		{Leader: true, Key: []byte("abcdefg"), Timestamp: timestamp.Add(0, -1), Value: value},
-		{Leader: true, Key: []byte("x"), Timestamp: timestamp, Value: value},
-		{Leader: false, Key: []byte("x"), Timestamp: timestamp, Value: []byte("bar")},
-		{Leader: true, Key: []byte("y"), Timestamp: timestamp, Value: value},
-		{Leader: false, Key: []byte("z"), Timestamp: timestamp, Value: value},
+		{LeaseHolder: true, Key: []byte("a"), Timestamp: timestamp, Value: value},
+		{LeaseHolder: false, Key: []byte("ab"), Timestamp: timestamp, Value: value},
+		{LeaseHolder: true, Key: []byte("abcd"), Timestamp: timestamp, Value: value},
+		{LeaseHolder: false, Key: []byte("abcdef"), Timestamp: timestamp, Value: value},
+		{LeaseHolder: false, Key: []byte("abcdefg"), Timestamp: timestamp.Add(0, 1), Value: value},
+		{LeaseHolder: true, Key: []byte("abcdefg"), Timestamp: timestamp.Add(0, -1), Value: value},
+		{LeaseHolder: true, Key: []byte("x"), Timestamp: timestamp, Value: value},
+		{LeaseHolder: false, Key: []byte("x"), Timestamp: timestamp, Value: []byte("bar")},
+		{LeaseHolder: true, Key: []byte("y"), Timestamp: timestamp, Value: value},
+		{LeaseHolder: false, Key: []byte("z"), Timestamp: timestamp, Value: value},
 	}
 
 	diff := diffRange(leaderSnapshot, replicaSnapshot)
@@ -5532,7 +5601,7 @@ func TestDiffRange(t *testing.T) {
 
 	for i, e := range eDiff {
 		v := diff[i]
-		if e.Leader != v.Leader || !bytes.Equal(e.Key, v.Key) || !e.Timestamp.Equal(v.Timestamp) || !bytes.Equal(e.Value, v.Value) {
+		if e.LeaseHolder != v.LeaseHolder || !bytes.Equal(e.Key, v.Key) || !e.Timestamp.Equal(v.Timestamp) || !bytes.Equal(e.Value, v.Value) {
 			t.Fatalf("diff varies at row %d, %v vs %v", i, e, v)
 		}
 	}
@@ -5712,7 +5781,7 @@ func runWrongIndexTest(t *testing.T, repropose bool, withErr bool, expProposals 
 	}
 	tc.rng.mu.Unlock()
 
-	if pErr := tc.rng.redirectOnOrAcquireLeaderLease(context.Background()); pErr != nil {
+	if pErr := tc.rng.redirectOnOrAcquireLease(context.Background()); pErr != nil {
 		fatalf("%s", pErr)
 	}
 
@@ -5736,13 +5805,13 @@ func runWrongIndexTest(t *testing.T, repropose bool, withErr bool, expProposals 
 
 	wrongIndex := ai - 1 // will chose this as MaxLeaseIndex
 
-	log.Infof("test begins")
+	log.Infof(context.Background(), "test begins")
 
 	var ba roachpb.BatchRequest
 	ba.Timestamp = tc.clock.Now()
 	ba.Add(&pArg)
 
-	replica, err := tc.rng.GetReplica()
+	repDesc, err := tc.rng.GetReplicaDescriptor()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5754,7 +5823,7 @@ func runWrongIndexTest(t *testing.T, repropose bool, withErr bool, expProposals 
 		preAssigned := tc.rng.mu.lastAssignedLeaseIndex
 		cmd := tc.rng.prepareRaftCommandLocked(
 			context.WithValue(context.Background(), magicKey{}, "foo"),
-			makeIDKey(), *replica, ba)
+			makeIDKey(), repDesc, ba)
 		cmd.raftCmd.MaxLeaseIndex = preAssigned
 		tc.rng.mu.lastAssignedLeaseIndex = preAssigned
 		if err != nil {
@@ -5763,7 +5832,7 @@ func runWrongIndexTest(t *testing.T, repropose bool, withErr bool, expProposals 
 		cmd.raftCmd.MaxLeaseIndex = wrongIndex
 		tc.rng.insertRaftCommandLocked(cmd)
 		if repropose {
-			if err := tc.rng.refreshPendingCmdsLocked(noReason); err != nil {
+			if err := tc.rng.refreshPendingCmdsLocked(noReason, 0); err != nil {
 				fatalf("%s", err)
 			}
 		} else if err := tc.rng.proposePendingCmdLocked(cmd); err != nil {
@@ -5835,7 +5904,7 @@ func TestReplicaCancelRaftCommandProgress(t *testing.T) {
 	tc.Start(t)
 	defer tc.Stop()
 	rng := tc.rng
-	replica, err := rng.GetReplica()
+	repDesc, err := rng.GetReplicaDescriptor()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5852,14 +5921,14 @@ func TestReplicaCancelRaftCommandProgress(t *testing.T) {
 			ba.Timestamp = tc.clock.Now()
 			ba.Add(&roachpb.PutRequest{Span: roachpb.Span{
 				Key: roachpb.Key(fmt.Sprintf("k%d", i))}})
-			cmd := rng.prepareRaftCommandLocked(context.Background(), makeIDKey(), *replica, ba)
+			cmd := rng.prepareRaftCommandLocked(context.Background(), makeIDKey(), repDesc, ba)
 			rng.insertRaftCommandLocked(cmd)
 			// We actually propose the command only if we don't
 			// cancel it to simulate the case in which Raft loses
 			// the command and it isn't reproposed due to the
 			// client abandoning it.
 			if rand.Intn(2) == 0 {
-				log.Infof("abandoning command %d", i)
+				log.Infof(context.Background(), "abandoning command %d", i)
 				delete(rng.mu.pendingCmds, cmd.idKey)
 			} else if err := rng.proposePendingCmdLocked(cmd); err != nil {
 				t.Fatal(err)
@@ -5884,11 +5953,17 @@ func TestReplicaCancelRaftCommandProgress(t *testing.T) {
 func TestReplicaBurstPendingCommandsAndRepropose(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var tc testContext
-	tc.Start(t)
+	sc := TestStoreContext()
+	// Ensure that the refresh call in this test is the only reason
+	// commands will get reproposed.
+	// TODO(bdarnell): why is this single-node test seeing a "new
+	// leader" (on rare occasions)? #8422
+	sc.TestingKnobs.DisableRefreshReasonNewLeader = true
+	tc.StartWithStoreContext(t, sc)
 	defer tc.Stop()
 
 	const num = 10
-	replica, err := tc.rng.GetReplica()
+	repDesc, err := tc.rng.GetReplicaDescriptor()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5905,7 +5980,7 @@ func TestReplicaBurstPendingCommandsAndRepropose(t *testing.T) {
 	}
 	tc.rng.mu.Unlock()
 
-	if pErr := tc.rng.redirectOnOrAcquireLeaderLease(context.Background()); pErr != nil {
+	if pErr := tc.rng.redirectOnOrAcquireLease(context.Background()); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -5923,8 +5998,9 @@ func TestReplicaBurstPendingCommandsAndRepropose(t *testing.T) {
 			ba.Timestamp = tc.clock.Now()
 			ba.Add(&roachpb.PutRequest{Span: roachpb.Span{
 				Key: roachpb.Key(fmt.Sprintf("k%d", i))}})
-			cmd := tc.rng.prepareRaftCommandLocked(ctx, makeIDKey(), *replica, ba)
+			cmd := tc.rng.prepareRaftCommandLocked(ctx, makeIDKey(), repDesc, ba)
 			tc.rng.insertRaftCommandLocked(cmd)
+			chs = append(chs, cmd.done)
 		}
 
 		for _, p := range tc.rng.mu.pendingCmds {
@@ -5939,7 +6015,7 @@ func TestReplicaBurstPendingCommandsAndRepropose(t *testing.T) {
 			t.Fatalf("wanted required indexes %v, got %v", expIndexes, origIndexes)
 		}
 
-		if err := tc.rng.refreshPendingCmdsLocked(noReason); err != nil {
+		if err := tc.rng.refreshPendingCmdsLocked(noReason, 0); err != nil {
 			t.Fatal(err)
 		}
 		return chs
@@ -5969,6 +6045,94 @@ func TestReplicaBurstPendingCommandsAndRepropose(t *testing.T) {
 	})
 }
 
+func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	var tc testContext
+	tc.Start(t)
+	defer tc.Stop()
+
+	// Grab processRaftMu in order to block normal raft replica processing. This
+	// test is ticking the replicas manually and doesn't want the store to be
+	// doing so concurrently.
+	tc.store.processRaftMu.Lock()
+	defer tc.store.processRaftMu.Unlock()
+
+	r := tc.rng
+	repDesc, err := r.GetReplicaDescriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	electionTicks := tc.store.ctx.RaftElectionTimeoutTicks
+
+	{
+		// The verifications of the reproposal counts below rely on r.mu.ticks
+		// starting with a value of 0 (modulo electionTicks). Move the replica into
+		// that state in case the replica was ticked before we grabbed
+		// processRaftMu.
+		r.mu.Lock()
+		ticks := r.mu.ticks
+		r.mu.Unlock()
+		for ; (ticks % electionTicks) != 0; ticks++ {
+			if err := r.tick(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// We tick the replica 2*RaftElectionTimeoutTicks. RaftElectionTimeoutTicks
+	// is special in that it controls how often pending commands are reproposed
+	// or refurbished.
+	for i := 0; i < 2*electionTicks; i++ {
+		// Add another pending command on each iteration.
+		r.mu.Lock()
+		id := fmt.Sprintf("%08d", i)
+		var ba roachpb.BatchRequest
+		ba.Timestamp = tc.clock.Now()
+		ba.Add(&roachpb.PutRequest{Span: roachpb.Span{Key: roachpb.Key(id)}})
+		cmd := r.prepareRaftCommandLocked(context.Background(),
+			storagebase.CmdIDKey(id), repDesc, ba)
+		r.insertRaftCommandLocked(cmd)
+		if err := r.proposePendingCmdLocked(cmd); err != nil {
+			t.Fatal(err)
+		}
+		// Build a map from command key to proposed-at-ticks.
+		m := map[storagebase.CmdIDKey]int{}
+		for id, p := range r.mu.pendingCmds {
+			m[id] = p.proposedAtTicks
+		}
+		r.mu.Unlock()
+
+		// Tick raft.
+		if err := r.tick(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Gather up the reproprosed commands.
+		r.mu.Lock()
+		var reproposed []*pendingCmd
+		for id, p := range r.mu.pendingCmds {
+			if m[id] != p.proposedAtTicks {
+				reproposed = append(reproposed, p)
+			}
+		}
+		ticks := r.mu.ticks
+		r.mu.Unlock()
+
+		// Reproposals are only performed every electionTicks. We'll need to fix
+		// this test if that changes.
+		if (ticks % electionTicks) == 0 {
+			if len(reproposed) != i-1 {
+				t.Fatalf("%d: expected %d reproprosed commands, but found %+v", i, i-1, reproposed)
+			}
+		} else {
+			if len(reproposed) != 0 {
+				t.Fatalf("%d: expected no reproprosed commands, but found %+v", i, reproposed)
+			}
+		}
+	}
+}
+
 // TestReplicaDoubleRefurbish exercises a code path in which a command is seen
 // fit for refurbishment, but has already been refurbished earlier (with that
 // command being in-flight). See #7185.
@@ -5981,7 +6145,7 @@ func TestReplicaDoubleRefurbish(t *testing.T) {
 	var ba roachpb.BatchRequest
 	ba.Timestamp = tc.clock.Now()
 	ba.Add(&roachpb.PutRequest{Span: roachpb.Span{Key: roachpb.Key("r")}})
-	replica, err := tc.rng.GetReplica()
+	repDesc, err := tc.rng.GetReplicaDescriptor()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5989,7 +6153,7 @@ func TestReplicaDoubleRefurbish(t *testing.T) {
 	// Make a Raft command; we'll set things up so that it will be considered
 	// for refurbishment multiple times.
 	tc.rng.mu.Lock()
-	cmd := tc.rng.prepareRaftCommandLocked(context.Background(), makeIDKey(), *replica, ba)
+	cmd := tc.rng.prepareRaftCommandLocked(context.Background(), makeIDKey(), repDesc, ba)
 	ch := cmd.done // must not use cmd outside of mutex
 	tc.rng.mu.Unlock()
 
@@ -6072,18 +6236,12 @@ func TestCommandTimeThreshold(t *testing.T) {
 	}
 
 	// Do a GC.
-	b := tc.store.Engine().NewBatch()
-	var h roachpb.Header
 	gcr := roachpb.GCRequest{
 		Threshold: ts2,
 	}
-	if _, err := tc.rng.GC(context.Background(), b, nil, h, gcr); err != nil {
+	if _, err := tc.SendWrapped(&gcr); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	b.Close()
 
 	// Do the same Get, which should now fail.
 	if _, err := tc.SendWrappedWith(roachpb.Header{
@@ -6138,20 +6296,20 @@ func TestReserveAndApplySnapshot(t *testing.T) {
 
 	key := roachpb.RKey("a")
 	firstRng := tc.store.LookupReplica(key, nil)
-	snap, err := firstRng.GetSnapshot()
+	snap, err := firstRng.GetSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	tc.store.metrics.available.Update(tc.store.bookie.maxReservedBytes)
+	tc.store.metrics.Available.Update(tc.store.bookie.maxReservedBytes)
 
 	// Note that this is an artificial scenario in which we're adding a
 	// reservation for a replica that is already on the range. This test is
 	// designed to test the filling of the reservation specifically and in
 	// normal operation there should not be a reservation for an existing
 	// replica.
-	req := roachpb.ReservationRequest{
-		StoreRequestHeader: roachpb.StoreRequestHeader{
+	req := ReservationRequest{
+		StoreRequestHeader: StoreRequestHeader{
 			StoreID: tc.store.StoreID(),
 			NodeID:  tc.store.nodeDesc.NodeID,
 		},
@@ -6159,11 +6317,14 @@ func TestReserveAndApplySnapshot(t *testing.T) {
 		RangeSize: 10,
 	}
 
-	if !tc.store.Reserve(req).Reserved {
+	if !tc.store.Reserve(context.Background(), req).Reserved {
 		t.Fatalf("Can't reserve the replica")
 	}
 	checkReservations(t, 1)
-	if _, err := firstRng.applySnapshot(snap); err != nil {
+
+	// Apply a snapshot and check the reservation was filled. Note that this
+	// out-of-band application could be a root cause if this test ever crashes.
+	if err := firstRng.applySnapshot(context.Background(), snap, raftpb.HardState{}); err != nil {
 		t.Fatal(err)
 	}
 	checkReservations(t, 0)

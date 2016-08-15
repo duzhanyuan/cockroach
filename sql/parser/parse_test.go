@@ -57,9 +57,11 @@ func TestParse(t *testing.T) {
 		{`CREATE INDEX a ON b.c (d)`},
 		{`CREATE INDEX ON a (b)`},
 		{`CREATE INDEX ON a (b) STORING (c)`},
+		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c (d)`},
 		{`CREATE INDEX ON a (b ASC, c DESC)`},
 		{`CREATE UNIQUE INDEX a ON b (c)`},
 		{`CREATE UNIQUE INDEX a ON b (c) STORING (d)`},
+		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d (e, f)`},
 		{`CREATE UNIQUE INDEX a ON b.c (d)`},
 
 		{`CREATE TABLE a ()`},
@@ -93,9 +95,14 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (a INT CONSTRAINT one DEFAULT 1 CONSTRAINT positive CHECK (a > 0))`},
 		// "0" lost quotes previously.
 		{`CREATE TABLE a (b INT, c TEXT, PRIMARY KEY (b, c, "0"))`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b, c) REFERENCES other)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b, c) REFERENCES other (x, y))`},
+		{`CREATE TABLE a (b INT, c TEXT, CONSTRAINT s FOREIGN KEY (b, c) REFERENCES other (x, y))`},
 		{`CREATE TABLE a (b INT, c TEXT, INDEX (b, c))`},
 		{`CREATE TABLE a (b INT, c TEXT, INDEX d (b, c))`},
 		{`CREATE TABLE a (b INT, c TEXT, CONSTRAINT d UNIQUE (b, c))`},
+		{`CREATE TABLE a (b INT, c TEXT, CONSTRAINT d UNIQUE (b, c) INTERLEAVE IN PARENT d (e, f))`},
 		{`CREATE TABLE a (b INT, UNIQUE (b))`},
 		{`CREATE TABLE a (b INT, UNIQUE (b) STORING (c))`},
 		{`CREATE TABLE a (b INT, INDEX (b))`},
@@ -104,8 +111,11 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b INT, c INT REFERENCES foo (bar))`},
 		{`CREATE TABLE a (b INT, INDEX (b) STORING (c))`},
 		{`CREATE TABLE a (b INT, c TEXT, INDEX (b ASC, c DESC) STORING (c))`},
+		{`CREATE TABLE a (b INT, INDEX (b) INTERLEAVE IN PARENT c (d, e))`},
 		{`CREATE TABLE a (b INT, FAMILY (b))`},
 		{`CREATE TABLE a (b INT, c STRING, FAMILY foo (b), FAMILY (c))`},
+		{`CREATE TABLE a (b INT) INTERLEAVE IN PARENT foo (c, d)`},
+		{`CREATE TABLE a (b INT) INTERLEAVE IN PARENT foo (c) CASCADE`},
 		{`CREATE TABLE a.b (b INT)`},
 		{`CREATE TABLE IF NOT EXISTS a (b INT)`},
 
@@ -149,11 +159,12 @@ func TestParse(t *testing.T) {
 		{`SHOW DATABASES`},
 		{`SHOW TABLES`},
 		{`SHOW TABLES FROM a`},
-		{`SHOW TABLES FROM a.b.c`},
 		{`SHOW COLUMNS FROM a`},
 		{`SHOW COLUMNS FROM a.b.c`},
 		{`SHOW INDEXES FROM a`},
 		{`SHOW INDEXES FROM a.b.c`},
+		{`SHOW CONSTRAINTS FROM a`},
+		{`SHOW CONSTRAINTS FROM a.b.c`},
 		{`SHOW TABLES FROM a; SHOW COLUMNS FROM b`},
 
 		// Tables are the default, but can also be specified with
@@ -300,6 +311,7 @@ func TestParse(t *testing.T) {
 
 		{`SELECT "FROM" FROM t`},
 		{`SELECT CAST(1 AS TEXT)`},
+		{`SELECT ANNOTATE_TYPE(1, TEXT)`},
 		{`SELECT a FROM t AS bar`},
 		{`SELECT a FROM t AS bar (bar1)`},
 		{`SELECT a FROM t AS bar (bar1, bar2, bar3)`},
@@ -327,8 +339,14 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE a NOT IN (b, c)`},
 		{`SELECT a FROM t WHERE a LIKE b`},
 		{`SELECT a FROM t WHERE a NOT LIKE b`},
+		{`SELECT a FROM t WHERE a ILIKE b`},
+		{`SELECT a FROM t WHERE a NOT ILIKE b`},
 		{`SELECT a FROM t WHERE a SIMILAR TO b`},
 		{`SELECT a FROM t WHERE a NOT SIMILAR TO b`},
+		{`SELECT a FROM t WHERE a ~ b`},
+		{`SELECT a FROM t WHERE a !~ b`},
+		{`SELECT a FROM t WHERE a ~* c`},
+		{`SELECT a FROM t WHERE a !~* c`},
 		{`SELECT a FROM t WHERE a BETWEEN b AND c`},
 		{`SELECT a FROM t WHERE a NOT BETWEEN b AND c`},
 		{`SELECT a FROM t WHERE a IS NULL`},
@@ -387,6 +405,9 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t1 NATURAL JOIN t2`},
 		{`SELECT a FROM t1 INNER JOIN t2 USING (a)`},
 		{`SELECT a FROM t1 FULL JOIN t2 USING (a)`},
+
+		{`SELECT a FROM t1 AS OF SYSTEM TIME '2016-01-01'`},
+		{`SELECT a FROM t1, t2 AS OF SYSTEM TIME '2016-01-01'`},
 
 		{`SELECT a FROM t LIMIT a`},
 		{`SELECT a FROM t OFFSET b`},
@@ -458,6 +479,9 @@ func TestParse(t *testing.T) {
 		{`ALTER TABLE IF EXISTS a ADD COLUMN b INT, ADD CONSTRAINT a_idx UNIQUE (a)`},
 		{`ALTER TABLE IF EXISTS a ADD COLUMN IF NOT EXISTS b INT, ADD CONSTRAINT a_idx UNIQUE (a)`},
 		{`ALTER TABLE a ADD b INT FAMILY fam_a`},
+		{`ALTER TABLE a ADD b INT CREATE FAMILY`},
+		{`ALTER TABLE a ADD b INT CREATE FAMILY fam_b`},
+		{`ALTER TABLE a ADD b INT CREATE IF NOT EXISTS FAMILY fam_b`},
 
 		{`ALTER TABLE a DROP b, DROP CONSTRAINT a_idx`},
 		{`ALTER TABLE a DROP IF EXISTS b, DROP CONSTRAINT a_idx`},
@@ -500,6 +524,8 @@ func TestParse2(t *testing.T) {
 	}{
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b))`,
 			`CREATE TABLE a (b INT, CONSTRAINT foo UNIQUE (b))`},
+		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b) INTERLEAVE IN PARENT c (d))`,
+			`CREATE TABLE a (b INT, CONSTRAINT foo UNIQUE (b) INTERLEAVE IN PARENT c (d))`},
 		{`CREATE INDEX ON a (b) COVERING (c)`, `CREATE INDEX ON a (b) STORING (c)`},
 
 		{`SELECT BOOL 'foo'`, `SELECT CAST('foo' AS BOOL)`},
@@ -604,6 +630,10 @@ func TestParse2(t *testing.T) {
 		// Shorthand type cast.
 		{`SELECT '1'::INT`,
 			`SELECT CAST('1' AS INT)`},
+		// Shorthand type annotation.
+		// TODO(nvanbenschoten) introduce a shorthand type annotation notation.
+		// {`SELECT '1'!INT`,
+		// 	`SELECT ANNOTATE_TYPE('1', INT)`},
 		// Double negation. See #1800.
 		{`SELECT *,-/* comment */-5`,
 			`SELECT *, - (- 5)`},
@@ -673,6 +703,8 @@ func TestParse2(t *testing.T) {
 			`SELECT RTRIM('xyxtrimyyx')`},
 		{`SHOW INDEX FROM t`,
 			`SHOW INDEXES FROM t`},
+		{`SHOW CONSTRAINT FROM t`,
+			`SHOW CONSTRAINTS FROM t`},
 		{`SHOW KEYS FROM t`,
 			`SHOW INDEXES FROM t`},
 		{`BEGIN`,
@@ -782,6 +814,13 @@ SELECT * FROM t WHERE k=
 CREATE TABLE test (
   CONSTRAINT foo INDEX (bar)
                  ^
+`},
+		{`CREATE TABLE test (
+  foo BIT(0)
+)`, `length for type bit must be at least 1 at or near ")"
+CREATE TABLE test (
+  foo BIT(0)
+           ^
 `},
 		{`CREATE DATABASE a b`,
 			`syntax error at or near "b"
@@ -912,6 +951,20 @@ DROP INDEX a
 			`syntax error at or near "family"
 ALTER TABLE t RENAME COLUMN x TO family
                                  ^
+`,
+		},
+		{
+			`SELECT CAST(1.2+2.3 AS notatype)`,
+			`syntax error at or near "notatype"
+SELECT CAST(1.2+2.3 AS notatype)
+                       ^
+`,
+		},
+		{
+			`SELECT ANNOTATE_TYPE(1.2+2.3, notatype)`,
+			`syntax error at or near "notatype"
+SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
+                              ^
 `,
 		},
 	}

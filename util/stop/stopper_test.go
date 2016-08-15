@@ -22,11 +22,14 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	_ "github.com/cockroachdb/cockroach/util/log" // for flags
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/pkg/errors"
 )
 
@@ -136,7 +139,7 @@ func TestStopperStartFinishTasks(t *testing.T) {
 
 		select {
 		case <-s.ShouldStop():
-			t.Fatal("expected stopper to be draining")
+			t.Fatal("expected stopper to be quiesceing")
 		case <-time.After(1 * time.Millisecond):
 			// Expected.
 		}
@@ -155,10 +158,7 @@ func TestStopperRunWorker(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	s.RunWorker(func() {
-		select {
-		case <-s.ShouldStop():
-			return
-		}
+		<-s.ShouldStop()
 	})
 	closer := make(chan struct{})
 	go func() {
@@ -173,7 +173,7 @@ func TestStopperRunWorker(t *testing.T) {
 	}
 }
 
-// TestStopperQuiesce tests coordinate drain with Quiesce.
+// TestStopperQuiesce tests coordinate quiesce with Quiesce.
 func TestStopperQuiesce(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var stoppers []*stop.Stopper
@@ -244,7 +244,7 @@ func TestStopperClosers(t *testing.T) {
 	s.AddCloser(&tc1)
 	s.AddCloser(&tc2)
 	s.Stop()
-	if bool(tc1) != true || bool(tc2) != true {
+	if !bool(tc1) || !bool(tc2) {
 		t.Errorf("expected true & true; got %t & %t", tc1, tc2)
 	}
 }
@@ -303,27 +303,53 @@ func TestStopperNumTasks(t *testing.T) {
 	s.Stop()
 }
 
-// TestStopperRunTaskPanic ensures that tasks are not leaked when they panic.
-// RunAsyncTask has a similar bit of logic, but it is not testable because
-// we cannot insert a recover() call in the right place.
+// TestStopperRunTaskPanic ensures that a panic handler can recover panicking
+// tasks, and that no tasks are leaked when they panic.
 func TestStopperRunTaskPanic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := stop.NewStopper()
+	ch := make(chan interface{})
+	s := stop.NewStopper(stop.OnPanic(func(v interface{}) {
+		ch <- v
+	}))
 	// If RunTask were not panic-safe, Stop() would deadlock.
-	defer s.Stop()
-	func() {
-		defer func() {
-			_ = recover()
-		}()
-		if err := s.RunTask(func() {
-			panic("ouch")
-		}); err != nil {
-			t.Fatal(err)
+	type testFn func()
+	explode := func() { panic(ch) }
+	for i, test := range []testFn{
+		func() {
+			_ = s.RunTask(explode)
+		},
+		func() {
+			_ = s.RunAsyncTask(explode)
+		},
+		func() {
+			_ = s.RunLimitedAsyncTask(
+				make(chan struct{}, 1),
+				explode,
+			)
+		},
+		func() {
+			s.RunWorker(explode)
+		},
+	} {
+		go test()
+		recovered := <-ch
+		if recovered != ch {
+			t.Errorf("%d: unexpected recovered value: %+v", i, recovered)
 		}
-	}()
+	}
 }
 
-func TestStopperShouldDrain(t *testing.T) {
+func TestStopperWithCancel(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := stop.NewStopper()
+	ctx := s.WithCancel(context.Background())
+	s.Stop()
+	if err := ctx.Err(); err != context.Canceled {
+		t.Fatal(err)
+	}
+}
+
+func TestStopperShouldQuiesce(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	running := make(chan struct{})
@@ -347,15 +373,15 @@ func TestStopperShouldDrain(t *testing.T) {
 	}
 
 	go func() {
-		// The ShouldDrain() channel should close as soon as the stopper is
+		// The ShouldQuiesce() channel should close as soon as the stopper is
 		// Stop()ed.
-		<-s.ShouldDrain()
+		<-s.ShouldQuiesce()
 		// However, the ShouldStop() channel should still be blocked because the
-		// async task started above is still running, meaning we haven't drained
+		// async task started above is still running, meaning we haven't quiesceed
 		// yet.
 		select {
 		case <-s.ShouldStop():
-			t.Fatal("expected ShouldStop() to block until draining complete")
+			t.Fatal("expected ShouldStop() to block until quiesceing complete")
 		default:
 			// Expected.
 		}
@@ -392,7 +418,7 @@ func TestStopperRunLimitedAsyncTask(t *testing.T) {
 	const maxConcurrency = 5
 	const duration = 10 * time.Millisecond
 	sem := make(chan struct{}, maxConcurrency)
-	var mu sync.Mutex
+	var mu syncutil.Mutex
 	concurrency := 0
 	peakConcurrency := 0
 	var wg sync.WaitGroup

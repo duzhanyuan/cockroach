@@ -18,10 +18,9 @@
 package securitytest
 
 import (
-	"testing"
-
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
+	"golang.org/x/net/context"
 )
 
 //go:generate go-bindata -pkg securitytest -mode 0644 -modtime 1400000000 -o ./embedded.go -ignore README.md -prefix ../../resource ../../resource/test_certs/...
@@ -35,11 +34,11 @@ import (
 // The file will have restrictive file permissions (0600), making it
 // appropriate for usage by libraries that require security assets to have such
 // restrictive permissions.
-func RestrictedCopy(t testing.TB, path, tempdir, name string) string {
+func RestrictedCopy(t util.Tester, path, tempdir, name string) string {
 	contents, err := Asset(path)
 	if err != nil {
 		if t == nil {
-			log.Fatal(err)
+			log.Fatal(context.TODO(), err)
 		} else {
 			t.Fatal(err)
 		}

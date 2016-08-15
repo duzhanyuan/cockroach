@@ -19,15 +19,17 @@ package storage
 import (
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/coreos/etcd/raft"
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
-	"github.com/coreos/etcd/raft"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -55,13 +57,13 @@ type replicaGCQueue struct {
 }
 
 // newReplicaGCQueue returns a new instance of replicaGCQueue.
-func newReplicaGCQueue(db *client.DB, gossip *gossip.Gossip) *replicaGCQueue {
+func newReplicaGCQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *replicaGCQueue {
 	q := &replicaGCQueue{
 		db: db,
 	}
-	q.baseQueue = makeBaseQueue("replicaGC", q, gossip, queueConfig{
+	q.baseQueue = makeBaseQueue("replicaGC", q, store, gossip, queueConfig{
 		maxSize:              replicaGCQueueMaxSize,
-		needsLeaderLease:     false,
+		needsLease:           false,
 		acceptsUnsplitRanges: true,
 	})
 	return q
@@ -69,20 +71,20 @@ func newReplicaGCQueue(db *client.DB, gossip *gossip.Gossip) *replicaGCQueue {
 
 // shouldQueue determines whether a replica should be queued for GC,
 // and if so at what priority. To be considered for possible GC, a
-// replica's leader lease must not have been active for longer than
+// replica's range lease must not have been active for longer than
 // ReplicaGCQueueInactivityThreshold. Further, the last replica GC
 // check must have occurred more than ReplicaGCQueueInactivityThreshold
 // in the past.
 func (*replicaGCQueue) shouldQueue(now hlc.Timestamp, rng *Replica, _ config.SystemConfig) (bool, float64) {
 	lastCheck, err := rng.getLastReplicaGCTimestamp()
 	if err != nil {
-		log.Errorf("could not read last replica GC timestamp: %s", err)
+		log.Errorf(context.TODO(), "could not read last replica GC timestamp: %s", err)
 		return false, 0
 	}
 
 	lastActivity := hlc.ZeroTimestamp.Add(rng.store.startedAt, 0)
 
-	lease, nextLease := rng.getLeaderLease()
+	lease, nextLease := rng.getLease()
 	if lease != nil {
 		lastActivity.Forward(lease.Expiration)
 	}
@@ -129,7 +131,12 @@ func replicaGCShouldQueueImpl(
 
 // process performs a consistent lookup on the range descriptor to see if we are
 // still a member of the range.
-func (q *replicaGCQueue) process(now hlc.Timestamp, rng *Replica, _ config.SystemConfig) error {
+func (q *replicaGCQueue) process(
+	ctx context.Context,
+	now hlc.Timestamp,
+	rng *Replica,
+	_ config.SystemConfig,
+) error {
 	// Note that the Replicas field of desc is probably out of date, so
 	// we should only use `desc` for its static fields like RangeID and
 	// StartKey (and avoid rng.GetReplica() for the same reason).
@@ -157,20 +164,12 @@ func (q *replicaGCQueue) process(now hlc.Timestamp, rng *Replica, _ config.Syste
 	}
 
 	replyDesc := reply.Ranges[0]
-	currentMember := false
-	storeID := rng.store.StoreID()
-	for _, rep := range replyDesc.Replicas {
-		if rep.StoreID == storeID {
-			currentMember = true
-			break
-		}
-	}
-
-	if !currentMember {
+	if _, currentMember := replyDesc.GetReplicaDescriptor(rng.store.StoreID()); !currentMember {
 		// We are no longer a member of this range; clean up our local data.
 		if log.V(1) {
-			log.Infof("destroying local data from range %d", desc.RangeID)
+			log.Infof(ctx, "destroying local data from range %d", desc.RangeID)
 		}
+		log.Trace(ctx, "destroying local data")
 		if err := rng.store.RemoveReplica(rng, replyDesc, true); err != nil {
 			return err
 		}
@@ -180,8 +179,9 @@ func (q *replicaGCQueue) process(now hlc.Timestamp, rng *Replica, _ config.Syste
 		// subsuming range. Shut down raft processing for the former range
 		// and delete any remaining metadata, but do not delete the data.
 		if log.V(1) {
-			log.Infof("removing merged range %d", desc.RangeID)
+			log.Infof(ctx, "removing merged range %d", desc.RangeID)
 		}
+		log.Trace(ctx, "removing merged range")
 		if err := rng.store.RemoveReplica(rng, replyDesc, false); err != nil {
 			return err
 		}
@@ -189,7 +189,7 @@ func (q *replicaGCQueue) process(now hlc.Timestamp, rng *Replica, _ config.Syste
 		// TODO(bdarnell): remove raft logs and other metadata (while leaving a
 		// tombstone). Add tests for GC of merged ranges.
 	} else {
-		// This range is a current member of the raft group. Set the last replica
+		// This replica is a current member of the raft group. Set the last replica
 		// GC check time to avoid re-processing for another check interval.
 		if err := rng.setLastReplicaGCTimestamp(now); err != nil {
 			return err

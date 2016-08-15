@@ -22,10 +22,14 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/acceptance/cluster"
+	"github.com/cockroachdb/cockroach/util/caller"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 func TestPartitionNemesis(t *testing.T) {
@@ -35,7 +39,7 @@ func TestPartitionNemesis(t *testing.T) {
 		s := stop.NewStopper()
 		defer s.Stop()
 		s.RunWorker(func() {
-			BidirectionalPartitionNemesis(t, s.ShouldDrain(), c)
+			BidirectionalPartitionNemesis(t, s.ShouldQuiesce(), c)
 		})
 		select {
 		case <-time.After(*flagDuration):
@@ -45,6 +49,7 @@ func TestPartitionNemesis(t *testing.T) {
 }
 
 func TestPartitionBank(t *testing.T) {
+	t.Skip("#7978")
 	SkipUnlessPrivileged(t)
 	runTestOnConfigs(t, testBankWithNemesis(BidirectionalPartitionNemesis))
 }
@@ -57,7 +62,8 @@ type Bank struct {
 
 func (b *Bank) must(err error) {
 	if err != nil {
-		b.Fatal(err)
+		f, l, _ := caller.Lookup(1)
+		b.Fatal(errors.Wrapf(err, "%s:%d", f, l))
 	}
 }
 
@@ -107,13 +113,13 @@ func (b *Bank) Verify() {
 }
 
 func (b *Bank) logFailed(i int, v interface{}) {
-	log.Warningf("%d: %v", i, v)
+	log.Warningf(context.Background(), "%d: %v", i, v)
 }
 func (b *Bank) logBegin(i int, from, to, amount int) {
-	log.Warningf("%d: %d trying to give $%d to %d", i, from, amount, to)
+	log.Warningf(context.Background(), "%d: %d trying to give $%d to %d", i, from, amount, to)
 }
 func (b *Bank) logSuccess(i int, from, to, amount int) {
-	log.Warningf("%d: %d gave $%d to %d", i, from, amount, to)
+	log.Warningf(context.Background(), "%d: %d gave $%d to %d", i, from, amount, to)
 }
 
 // Invoke transfers a random amount of money between random accounts.
@@ -172,7 +178,7 @@ func testBankWithNemesis(nemeses ...NemesisFn) configTestRunner {
 		b.Init(accounts, 10)
 		for _, nemesis := range nemeses {
 			s.RunWorker(func() {
-				nemesis(t, s.ShouldDrain(), c)
+				nemesis(t, s.ShouldQuiesce(), c)
 			})
 		}
 		for i := 0; i < concurrency; i++ {
@@ -180,7 +186,7 @@ func testBankWithNemesis(nemeses ...NemesisFn) configTestRunner {
 			if err := s.RunAsyncTask(func() {
 				for timeutil.Now().Before(deadline) {
 					select {
-					case <-s.ShouldDrain():
+					case <-s.ShouldQuiesce():
 						return
 					default:
 					}
@@ -194,7 +200,7 @@ func testBankWithNemesis(nemeses ...NemesisFn) configTestRunner {
 		case <-stopper:
 		case <-time.After(cfg.Duration):
 		}
-		log.Warningf("finishing test")
+		log.Warningf(context.Background(), "finishing test")
 		b.Verify()
 	}
 }

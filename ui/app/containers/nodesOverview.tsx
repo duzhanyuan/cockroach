@@ -6,7 +6,8 @@ import { createSelector } from "reselect";
 import * as d3 from "d3";
 import * as moment from "moment";
 
-import { refreshNodes } from "../redux/nodes";
+import { AdminUIState } from "../redux/state";
+import { refreshNodes } from "../redux/apiReducers";
 import { setUISetting } from "../redux/ui";
 import { SortableTable, SortableColumn, SortSetting } from "../components/sortabletable";
 import { NanoToMilli } from "../util/convert";
@@ -54,6 +55,8 @@ interface NodeColumnDescriptor {
   // in a collection. This is used to display an appropriate "total" value for
   // each column.
   rollup?: (ns: NodeStatus[]) => React.ReactNode;
+  // className to be applied to the td elements
+  className?: string;
 }
 
 /**
@@ -95,6 +98,7 @@ let columnDescriptors: NodeColumnDescriptor[] = [
         <span className="missing">{statuses.missing || 0}</span>
       </div>;
     },
+    className: "expand-link",
   },
   // Started at - displays the time that the node started.
   {
@@ -150,6 +154,7 @@ let columnDescriptors: NodeColumnDescriptor[] = [
     key: NodesTableColumn.Logs,
     title: "Logs",
     cell: (ns) => <Link to={"/nodes/" + ns.desc.node_id + "/logs"}>Logs</Link>,
+    className: "expand-link",
   },
 ];
 
@@ -219,6 +224,7 @@ class NodesMain extends React.Component<NodesMainProps, {}> {
           cell: (index) => cd.cell(statuses[index]),
           sortKey: cd.sort ? cd.key : undefined,
           rollup: rollups[cd.key],
+          className: cd.className,
         };
       });
     });
@@ -267,9 +273,9 @@ class NodesMain extends React.Component<NodesMainProps, {}> {
  */
 
 // Base selectors to extract data from redux state.
-let nodeQueryValid = (state: any): boolean => state.nodes.isValid;
-let nodeStatuses = (state: any): NodeStatus[] => state.nodes.statuses;
-let sortSetting = (state: any): SortSetting => state.ui[UI_NODES_SORT_SETTING_KEY] || {};
+let nodeQueryValid = (state: AdminUIState): boolean => state.cachedData.nodes.valid;
+let nodeStatuses = (state: AdminUIState): NodeStatus[] => state.cachedData.nodes.data;
+let sortSetting = (state: AdminUIState): SortSetting => state.ui[UI_NODES_SORT_SETTING_KEY] || {};
 
 // Selector which sorts statuses according to current sort setting.
 let sortFunctionLookup = _.reduce(
@@ -317,7 +323,7 @@ let rollupStatuses = createSelector(
 
 // Connect the NodesMain class with our redux store.
 let nodesMainConnected = connect(
-  (state, ownProps) => {
+  (state: AdminUIState) => {
     return {
       sortedStatuses: sortedStatuses(state),
       statusRollups: rollupStatuses(state),

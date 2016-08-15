@@ -13,7 +13,6 @@ import { Action, PayloadAction } from "../interfaces/action";
 import { queryTimeSeries } from "../util/api";
 
 type TSRequestMessage = cockroach.ts.tspb.TimeSeriesQueryRequestMessage;
-type TSResponse = cockroach.ts.tspb.TimeSeriesQueryResponse;
 type TSResponseMessage = cockroach.ts.tspb.TimeSeriesQueryResponseMessage;
 
 export const REQUEST = "cockroachui/metrics/REQUEST";
@@ -198,7 +197,7 @@ export function receiveMetrics(id: string, request: TSRequestMessage,
 }
 
 /**
- * errorMetrics indicates that a pervious request from this component could not
+ * errorMetrics indicates that a previous request from this component could not
  * be fulfilled due to an error.
  */
 export function errorMetrics(id: string, error: Error): PayloadAction<WithID<Error>> {
@@ -253,8 +252,8 @@ let queuePromise: Promise<void> = null;
  * specifically, queries which have the same time span can be handled by the
  * server in a single call.
  */
-export function queryMetrics(id: string, query: TSRequestMessage) {
-  return (dispatch: Dispatch): Promise<void> => {
+export function queryMetrics<S>(id: string, query: TSRequestMessage) {
+  return (dispatch: Dispatch<S>): Promise<void> => {
     // Indicate that this request has been received and queued.
     dispatch(requestMetrics(id, query));
     queuedRequests.push({

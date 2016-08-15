@@ -52,6 +52,8 @@ message Ordering {
   repeated Column columns = 1 [(gogoproto.nullable) = false];
 }
 
+// A mailbox is where a stream "crosses" hosts - it is an endpoint of a local
+// stream which receives data from or sends to a remote host.
 message MailboxSpec {
   // If set, we are in a special "simple flow" mode. In this mode, we return
   // results directly as part of the RPC call that set up the flow. This saves
@@ -60,17 +62,24 @@ message MailboxSpec {
   // only mailbox in that flow.
   optional bool simple_response = 1 [(gogoproto.nullable) = false];
 
-  // TODO(radu): info for how to connect to a remote machine will follow.
+  // The ID used to refer to this mailbox in a StreamHeader.
+  optional int32 stream_id = 2 [(gogoproto.nullable) = false,
+                                (gogoproto.customname) = "StreamID",
+                                (gogoproto.casttype) = "StreamID"];
+
+  // Serving address for the target host, used for outgoing mailboxes.
+  optional string target_addr = 3 [(gogoproto.nullable) = false];
 }
 
 // StreamEndpointSpec describes one of the endpoints (input or output) of a physical
 // stream.
 message StreamEndpointSpec {
-  option (gogoproto.onlyone) = true;
-
   // If set, both ends of the stream are part of the flow on this machine. There
-  // will be a corresponding endpoint with the same local stream ID.
-  optional int32 local_stream_id = 1 [(gogoproto.customname) = "LocalStreamID"];
+  // will be a corresponding endpoint with the same local stream ID. Can only be
+  // set if mailbox is not set.
+  optional int32 local_stream_id = 1 [(gogoproto.nullable) = false,
+                                      (gogoproto.customname) = "LocalStreamID",
+                                      (gogoproto.casttype) = "LocalStreamID"];
   // If set, the stream crosses flows; the endpoint is a mailbox.
   optional MailboxSpec mailbox = 2;
 }
@@ -86,8 +95,9 @@ message InputSyncSpec {
     // ordering.
     ORDERED = 1;
   }
-  optional Ordering ordering = 1 [(gogoproto.nullable) = false];
-  repeated StreamEndpointSpec streams = 2 [(gogoproto.nullable) = false];
+  optional Type type = 1 [(gogoproto.nullable) = false];
+  optional Ordering ordering = 2 [(gogoproto.nullable) = false];
+  repeated StreamEndpointSpec streams = 3 [(gogoproto.nullable) = false];
 }
 
 // OutputRouterSpec is the specification for the output router of a processor;
@@ -98,8 +108,7 @@ message OutputRouterSpec {
     // single output stream).
     MIRROR = 0;
     // Each row is sent to one stream, chosen by hashing certain columns of
-    // the row. TODO(radu): an extra optional structure below for the hashing
-    // details.
+    // the row (specified by the hash_columns field).
     BY_HASH = 1;
     // Each row is sent to one stream, chosen according to preset boundaries
     // for the values of certain columns of the row. TODO(radu): an extra
@@ -108,6 +117,10 @@ message OutputRouterSpec {
   }
   optional Type type = 1 [(gogoproto.nullable) = false];
   repeated StreamEndpointSpec streams = 2 [(gogoproto.nullable) = false];
+
+  // Only used for the BY_HASH type; these are the indexes of the columns we are
+  // hashing.
+  repeated uint32 hash_columns = 3;
 }
 
 message DatumInfo {
@@ -117,8 +130,16 @@ message DatumInfo {
 
 // StreamHeader is a message that is sent once at the beginning of a stream.
 message StreamHeader {
+  optional bytes flow_id = 1 [(gogoproto.nullable) = false,
+                              (gogoproto.customname) = "FlowID",
+                              (gogoproto.customtype) = "FlowID"];
+
+  optional int32 stream_id = 2 [(gogoproto.nullable) = false,
+                                (gogoproto.customname) = "StreamID",
+                                (gogoproto.casttype) = "StreamID"];
+
   // There is one DatumInfo for each element in a row.
-  repeated DatumInfo info = 1 [(gogoproto.nullable) = false];
+  repeated DatumInfo info = 3 [(gogoproto.nullable) = false];
 }
 
 // StreamData is a message that can be sent multiple times as part of a stream.

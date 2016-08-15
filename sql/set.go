@@ -39,7 +39,7 @@ func (p *planner) Set(n *parser.Set) (planNode, error) {
 		return nil, errors.New("invalid statement: SET ROW")
 	}
 
-	// By using QualifiedName.String() here any variables that are keywords will
+	// By using VarName.String() here any variables that are keywords will
 	// be double quoted.
 	name := strings.ToUpper(n.Name.String())
 	typedValues := make([]parser.TypedExpr, len(n.Values))
@@ -58,12 +58,8 @@ func (p *planner) Set(n *parser.Set) (planNode, error) {
 		}
 		if len(dbName) != 0 {
 			// Verify database descriptor exists.
-			dbDesc, err := p.getDatabaseDesc(dbName)
-			if err != nil {
+			if _, err := p.mustGetDatabaseDesc(dbName); err != nil {
 				return nil, err
-			}
-			if dbDesc == nil {
-				return nil, sqlbase.NewUndefinedDatabaseError(dbName)
 			}
 		}
 		p.session.Database = dbName
@@ -73,10 +69,10 @@ func (p *planner) Set(n *parser.Set) (planNode, error) {
 		if err != nil {
 			return nil, err
 		}
-		switch sqlbase.NormalizeName(s) {
-		case sqlbase.NormalizeName(parser.Modern.String()):
+		switch sqlbase.NormalizeName(parser.Name(s)) {
+		case sqlbase.ReNormalizeName(parser.Modern.String()):
 			p.session.Syntax = int32(parser.Modern)
-		case sqlbase.NormalizeName(parser.Traditional.String()):
+		case sqlbase.ReNormalizeName(parser.Traditional.String()):
 			p.session.Syntax = int32(parser.Traditional)
 		default:
 			return nil, fmt.Errorf("%s: \"%s\" is not in (%q, %q)", name, s, parser.Modern, parser.Traditional)

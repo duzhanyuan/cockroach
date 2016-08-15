@@ -59,7 +59,7 @@ const (
 // Parser wraps a scanner, parser and other utilities present in the parser
 // package.
 type Parser struct {
-	scanner            scanner
+	scanner            Scanner
 	parserImpl         sqlParserImpl
 	normalizeVisitor   normalizeVisitor
 	isAggregateVisitor IsAggregateVisitor
@@ -159,6 +159,19 @@ func ParseOne(sql string, syntax Syntax) (Statement, error) {
 // ParseOneTraditional is short-hand for ParseOne(sql, Traditional)
 func ParseOneTraditional(sql string) (Statement, error) {
 	return ParseOne(sql, Traditional)
+}
+
+// ParseTableNameTraditional parses a table name.
+func ParseTableNameTraditional(sql string) (*TableName, error) {
+	stmt, err := ParseOneTraditional(fmt.Sprintf("ALTER TABLE %s RENAME TO x", sql))
+	if err != nil {
+		return nil, err
+	}
+	rename, ok := stmt.(*RenameTable)
+	if !ok {
+		return nil, errors.Errorf("expected an ALTER TABLE statement, but found %T", stmt)
+	}
+	return rename.Name.Normalize()
 }
 
 // parseExprs parses one or more sql expression.

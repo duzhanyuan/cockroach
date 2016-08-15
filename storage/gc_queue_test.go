@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/keys"
@@ -35,8 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/uuid"
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 )
 
 // makeTS creates a new hybrid logical timestamp.
@@ -64,7 +64,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 	desc := tc.rng.Desc()
 	zone, err := cfg.GetZoneConfigForKey(desc.StartKey)
 	if err != nil {
-		log.Errorf("could not find GC policy for range %s: %s, got zone %+v",
+		log.Errorf(context.Background(), "could not find GC policy for range %s: %s, got zone %+v",
 			tc.rng, err, zone)
 		return
 	}
@@ -124,7 +124,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 		{0, 0, 2, 0, hlc.ZeroTimestamp, true, 1},
 	}
 
-	gcQ := newGCQueue(tc.gossip)
+	gcQ := newGCQueue(tc.store, tc.gossip)
 
 	for i, test := range testCases {
 		// Write gc'able bytes as key bytes; since "live" bytes will be
@@ -143,7 +143,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 			// leading to inconsistent state.
 			tc.rng.mu.Lock()
 			defer tc.rng.mu.Unlock()
-			if err := setMVCCStats(tc.rng.store.Engine(), tc.rng.RangeID, ms); err != nil {
+			if err := setMVCCStats(context.Background(), tc.rng.store.Engine(), tc.rng.RangeID, ms); err != nil {
 				t.Fatal(err)
 			}
 			tc.rng.mu.state.Stats = ms
@@ -272,8 +272,8 @@ func TestGCQueueProcess(t *testing.T) {
 	}
 
 	// Process through a scan queue.
-	gcQ := newGCQueue(tc.gossip)
-	if err := gcQ.process(tc.clock.Now(), tc.rng, cfg); err != nil {
+	gcQ := newGCQueue(tc.store, tc.gossip)
+	if err := gcQ.process(context.Background(), tc.clock.Now(), tc.rng, cfg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -312,7 +312,7 @@ func TestGCQueueProcess(t *testing.T) {
 	}
 	for i, kv := range kvs {
 		if log.V(1) {
-			log.Infof("%d: %s", i, kv.Key)
+			log.Infof(context.Background(), "%d: %s", i, kv.Key)
 		}
 	}
 	if len(kvs) != len(expKVs) {
@@ -326,7 +326,7 @@ func TestGCQueueProcess(t *testing.T) {
 			t.Errorf("%d: expected ts=%s; got %s", i, expKVs[i].ts, kv.Key.Timestamp)
 		}
 		if log.V(1) {
-			log.Infof("%d: %s", i, kv.Key)
+			log.Infof(context.Background(), "%d: %s", i, kv.Key)
 		}
 	}
 
@@ -488,13 +488,13 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	}
 
 	// Run GC.
-	gcQ := newGCQueue(tc.gossip)
+	gcQ := newGCQueue(tc.store, tc.gossip)
 	cfg, ok := tc.gossip.GetSystemConfig()
 	if !ok {
 		t.Fatal("config not set")
 	}
 
-	if err := gcQ.process(tc.clock.Now(), tc.rng, cfg); err != nil {
+	if err := gcQ.process(context.Background(), tc.clock.Now(), tc.rng, cfg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -526,7 +526,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if (abortExists == false) != sp.expAbortGC {
+			if abortExists == sp.expAbortGC {
 				return fmt.Errorf("%s: expected abort cache gc: %t, found %+v", strKey, sp.expAbortGC, entry)
 			}
 		}
@@ -591,8 +591,8 @@ func TestGCQueueIntentResolution(t *testing.T) {
 	}
 
 	// Process through a scan queue.
-	gcQ := newGCQueue(tc.gossip)
-	if err := gcQ.process(tc.clock.Now(), tc.rng, cfg); err != nil {
+	gcQ := newGCQueue(tc.store, tc.gossip)
+	if err := gcQ.process(context.Background(), tc.clock.Now(), tc.rng, cfg); err != nil {
 		t.Fatal(err)
 	}
 

@@ -17,19 +17,26 @@
 package rpc
 
 import (
-	"sync"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/pkg/errors"
 )
 
 type remoteClockMetrics struct {
-	clusterOffsetLowerBound *metric.Gauge
-	clusterOffsetUpperBound *metric.Gauge
+	ClusterOffsetLowerBound *metric.Gauge
+	ClusterOffsetUpperBound *metric.Gauge
 }
+
+var (
+	metaClusterOffsetLowerBound = metric.Metadata{Name: "clock-offset.lower-bound-nanos"}
+	metaClusterOffsetUpperBound = metric.Metadata{Name: "clock-offset.upper-bound-nanos"}
+)
 
 // RemoteClockMonitor keeps track of the most recent measurements of remote
 // offsets from this node to connected nodes.
@@ -38,12 +45,11 @@ type RemoteClockMonitor struct {
 	offsetTTL time.Duration
 
 	mu struct {
-		sync.Mutex
+		syncutil.Mutex
 		offsets map[string]RemoteOffset
 	}
 
-	metrics  remoteClockMetrics
-	registry *metric.Registry
+	metrics remoteClockMetrics
 }
 
 // newRemoteClockMonitor returns a monitor with the given server clock.
@@ -51,12 +57,11 @@ func newRemoteClockMonitor(clock *hlc.Clock, offsetTTL time.Duration) *RemoteClo
 	r := RemoteClockMonitor{
 		clock:     clock,
 		offsetTTL: offsetTTL,
-		registry:  metric.NewRegistry(),
 	}
 	r.mu.offsets = make(map[string]RemoteOffset)
 	r.metrics = remoteClockMetrics{
-		clusterOffsetLowerBound: r.registry.Gauge("lower-bound-nanos"),
-		clusterOffsetUpperBound: r.registry.Gauge("upper-bound-nanos"),
+		ClusterOffsetLowerBound: metric.NewGauge(metaClusterOffsetLowerBound),
+		ClusterOffsetUpperBound: metric.NewGauge(metaClusterOffsetUpperBound),
 	}
 	return &r
 }
@@ -97,7 +102,7 @@ func (r *RemoteClockMonitor) UpdateOffset(addr string, offset RemoteOffset) {
 	}
 
 	if log.V(2) {
-		log.Infof("update offset: %s %v", addr, r.mu.offsets[addr])
+		log.Infof(context.TODO(), "update offset: %s %v", addr, r.mu.offsets[addr])
 	}
 }
 
@@ -132,7 +137,7 @@ func (r *RemoteClockMonitor) VerifyClockOffset() error {
 			return errors.Errorf("fewer than half the known nodes are within the maximum offset of %s (%d of %d)", maxOffset, healthyOffsetCount, numClocks)
 		}
 		if log.V(1) {
-			log.Infof("%d of %d nodes are within the maximum offset of %s", healthyOffsetCount, numClocks, maxOffset)
+			log.Infof(context.TODO(), "%d of %d nodes are within the maximum offset of %s", healthyOffsetCount, numClocks, maxOffset)
 		}
 	}
 
@@ -161,7 +166,7 @@ func (r RemoteOffset) isHealthy(maxOffset time.Duration) bool {
 		// health is ambiguous. For now, we err on the side of not spuriously
 		// killing nodes.
 		if log.V(1) {
-			log.Infof("uncertain remote offset %s for maximum offset %s, treating as healthy", r, maxOffset)
+			log.Infof(context.TODO(), "uncertain remote offset %s for maximum offset %s, treating as healthy", r, maxOffset)
 		}
 		return true
 	}
@@ -171,8 +176,9 @@ func (r RemoteOffset) isStale(ttl time.Duration, now time.Time) bool {
 	return r.measuredAt().Add(ttl).Before(now)
 }
 
-// Registry returns a registry with the metrics tracked by this server, which can be used to
-// access its stats or be added to another registry.
-func (r *RemoteClockMonitor) Registry() *metric.Registry {
-	return r.registry
+// RegisterMetrics adds the local metrics to a registry.
+// TODO(marc): this pattern deviates from other users of the registry
+// that take it as an argument at metric construction time.
+func (r *RemoteClockMonitor) RegisterMetrics(reg *metric.Registry) {
+	reg.AddMetricStruct(r.metrics)
 }

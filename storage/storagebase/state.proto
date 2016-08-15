@@ -37,10 +37,10 @@ message ReplicaState {
   // The pointer may change, but the referenced RangeDescriptor struct itself
   // must be treated as immutable; it is leaked out of the lock.
   //
-  // Changes of the descriptor should normally go through one of the
+  // Changes of the descriptor should always go through one of the
   // (*Replica).setDesc* methods.
   roachpb.RangeDescriptor desc = 3;
-  // The latest lease holder, if any.
+  // The latest lease, if any.
   roachpb.Lease lease = 4;
   // The truncation state of the Raft log.
   roachpb.RaftTruncatedState truncated_state = 5;
@@ -59,4 +59,8 @@ message RangeInfo {
   uint64 lastIndex = 2;
   uint64 num_pending = 3;
   util.hlc.Timestamp last_verification = 4 [(gogoproto.nullable) = false];
+  uint64 num_dropped = 5;
+  // raft_log_size may be initially inaccurate after a server restart.
+  // See storage.Replica.mu.raftLogSize.
+  int64 raft_log_size = 6;
 }

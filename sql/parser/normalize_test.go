@@ -19,7 +19,7 @@ package parser
 import "testing"
 
 func TestNormalizeExpr(t *testing.T) {
-	defer mockQualifiedNameTypes(map[string]Datum{
+	defer mockNameTypes(map[string]Datum{
 		"a": TypeInt,
 		"b": TypeInt,
 		"c": TypeInt,
@@ -32,6 +32,27 @@ func TestNormalizeExpr(t *testing.T) {
 	}{
 		{`(a)`, `a`},
 		{`((((a))))`, `a`},
+		{`CAST(NULL AS INTEGER)`, `NULL`},
+		{`+a`, `a`},
+		{`-(-a)`, `a`},
+		{`-+-a`, `a`},
+		{`-(a-b)`, `b - a`},
+		{`-0`, `0`},
+		{`-NULL`, `NULL`},
+		{`-1`, `-1`},
+		{`a+0`, `a`},
+		{`0+a`, `a`},
+		{`a+(2-2)`, `a`},
+		{`a-0`, `a`},
+		{`a*1`, `a`},
+		{`1*a`, `a`},
+		{`a+NULL`, `NULL`},
+		{`a/1`, `CAST(a AS DECIMAL)`},
+		{`0/a`, `0 / a`},
+		{`0/1`, `0`},
+		{`12 BETWEEN 24 AND 36`, `false`},
+		{`12 BETWEEN 10 AND 20`, `true`},
+		{`10 BETWEEN a AND 20`, `a <= 10`},
 		{`a BETWEEN b AND c`, `(a >= b) AND (a <= c)`},
 		{`a NOT BETWEEN b AND c`, `(a < b) OR (a > c)`},
 		{`a BETWEEN NULL AND c`, `NULL`},
@@ -62,7 +83,15 @@ func TestNormalizeExpr(t *testing.T) {
 		{`1 IN (1, 2, a)`, `1 IN (1, 2, a)`},
 		{`NULL IN (1, 2, 3)`, `NULL`},
 		{`NULL LIKE 'a'`, `NULL`},
+		{`NULL NOT LIKE 'a'`, `NULL`},
+		{`NULL ILIKE 'a'`, `NULL`},
+		{`NULL NOT ILIKE 'a'`, `NULL`},
 		{`NULL SIMILAR TO 'a'`, `NULL`},
+		{`NULL NOT SIMILAR TO 'a'`, `NULL`},
+		{`NULL ~ 'a'`, `NULL`},
+		{`NULL !~ 'a'`, `NULL`},
+		{`NULL ~* 'a'`, `NULL`},
+		{`NULL !~* 'a'`, `NULL`},
 		{`a<1`, `a < 1`},
 		{`1>a`, `a < 1`},
 		{`a<NULL`, `NULL`},
@@ -89,6 +118,13 @@ func TestNormalizeExpr(t *testing.T) {
 		{`(1, 2, 3) = (1, 2, 3)`, `true`},
 		{`(1, 2, 3) IN ((1, 2, 3), (4, 5, 6))`, `true`},
 		{`(1, 'one')`, `(1, 'one')`},
+		{`ANNOTATE_TYPE(1, float)`, `1.0`},
+		// TODO(nvanbenschoten) introduce a shorthand type annotation notation.
+		// {`1!float`, `1.0`},
+		{`IF((true AND a < 0), (0 + a)::decimal, 2 / (1 - 1))`, `IF(a < 0, CAST(a AS DECIMAL), 2 / 0)`},
+		{`IF((true OR a < 0), (0 + a)::decimal, 2 / (1 - 1))`, `CAST(a AS DECIMAL)`},
+		{`COALESCE(NULL, (NULL < 3), a = 2 - 1, d)`, `COALESCE(a = 1, d)`},
+		{`COALESCE(NULL, a)`, `a`},
 	}
 	for _, d := range testData {
 		expr, err := ParseExprTraditional(d.expr)

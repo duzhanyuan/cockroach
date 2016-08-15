@@ -27,7 +27,7 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
@@ -260,8 +260,7 @@ func TestTxnCoordSenderKeyRanges(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a transaction to be created on coordinator")
 	}
-	roachpb.MergeSpans(&txnMeta.keys)
-	keys := txnMeta.keys
+	keys, _ := roachpb.MergeSpans(txnMeta.keys)
 	if len(keys) != 2 {
 		t.Errorf("expected 2 entries in keys range group; got %v", keys)
 	}
@@ -499,8 +498,7 @@ func TestTxnCoordSenderAddIntentOnError(t *testing.T) {
 	}
 	sender.Lock()
 	txnID := *txn.Proto.ID
-	roachpb.MergeSpans(&sender.txns[txnID].keys)
-	intentSpans := sender.txns[txnID].keys
+	intentSpans, _ := roachpb.MergeSpans(sender.txns[txnID].keys)
 	expSpans := []roachpb.Span{{Key: key, EndKey: []byte("")}}
 	equal := !reflect.DeepEqual(intentSpans, expSpans)
 	sender.Unlock()
@@ -564,6 +562,46 @@ func TestTxnCoordSenderCleanupOnAborted(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyCleanup(key, sender, s.Eng, t)
+}
+
+func TestTxnCoordSenderCancel(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, sender := createTestDB(t)
+	defer s.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	origSender := sender.wrapped
+	sender.wrapped = client.SenderFunc(
+		func(ctx context.Context, args roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+			if _, hasET := args.GetArg(roachpb.EndTransaction); hasET {
+				// Cancel the transaction while also sending it along. This tickled a
+				// data race in TxnCoordSender.tryAsyncAbort. See #7726.
+				cancel()
+			}
+			return origSender.Send(ctx, args)
+		})
+
+	// Create a transaction with bunch of intents.
+	txn := client.NewTxn(ctx, *s.DB)
+	batch := txn.NewBatch()
+	for i := 0; i < 100; i++ {
+		key := roachpb.Key(fmt.Sprintf("%d", i))
+		batch.Put(key, []byte("value"))
+	}
+	if err := txn.Run(batch); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit the transaction. Note that we cancel the transaction when the
+	// commit is sent which stresses the TxnCoordSender.tryAsyncAbort code
+	// path. We'll either succeed, get a "does not exist" error, or get a
+	// context canceled error. Anything else is unexpected.
+	err := txn.CommitOrCleanup()
+	if err != nil && err.Error() != context.Canceled.Error() &&
+		!testutils.IsError(err, "does not exist") {
+		t.Fatal(err)
+	}
 }
 
 // TestTxnCoordSenderGCTimeout verifies that the coordinator cleans up extant
@@ -1132,7 +1170,7 @@ func TestTxnCommit(t *testing.T) {
 	db := client.NewDB(sender)
 
 	// Test normal commit.
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		key := []byte("key-commit")
 
 		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
@@ -1163,7 +1201,7 @@ func TestTxnOnePhaseCommit(t *testing.T) {
 	value := []byte("value")
 	db := client.NewDB(sender)
 
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		key := []byte("key-commit")
 		b := txn.NewBatch()
 		b.Put(key, value)
@@ -1187,7 +1225,7 @@ func TestTxnAbandonCount(t *testing.T) {
 	// abandoned transactions.
 	sender.heartbeatInterval = 2 * time.Millisecond
 	sender.clientTimeout = 1 * time.Millisecond
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		key := []byte("key-abandon")
 
 		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
@@ -1224,7 +1262,7 @@ func TestTxnReadAfterAbandon(t *testing.T) {
 	sender.heartbeatInterval = 2 * time.Millisecond
 	sender.clientTimeout = 1 * time.Millisecond
 
-	err := db.Txn(func(txn *client.Txn) error {
+	err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		key := []byte("key-abandon")
 
 		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
@@ -1263,7 +1301,7 @@ func TestTxnAbortCount(t *testing.T) {
 
 	intentionalErrText := "intentional error to cause abort"
 	// Test aborted transaction.
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		key := []byte("key-abort")
 
 		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
@@ -1330,7 +1368,7 @@ func TestTxnDurations(t *testing.T) {
 	const incr int64 = 1000
 	for i := 0; i < puts; i++ {
 		key := roachpb.Key(fmt.Sprintf("key-txn-durations-%d", i))
-		if err := db.Txn(func(txn *client.Txn) error {
+		if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 			if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 				return err
 			}

@@ -55,8 +55,10 @@ func TestPrettyPrint(t *testing.T) {
 		{RaftAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftAppliedIndex"},
 		{LeaseAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/LeaseAppliedIndex"},
 		{RaftTruncatedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTruncatedState"},
-		{RangeLeaderLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLeaderLease"},
+		{RangeLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLease"},
 		{RangeStatsKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeStats"},
+		{RangeFrozenStatusKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeFrozenStatus"},
+		{RangeLastGCKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLastGC"},
 
 		{RaftHardStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftHardState"},
 		{RaftLastIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftLastIndex"},
@@ -66,7 +68,6 @@ func TestPrettyPrint(t *testing.T) {
 
 		{MakeRangeKeyPrefix(roachpb.RKey("ok")), `/Local/Range/"ok"`},
 		{RangeDescriptorKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeDescriptor`},
-		{RangeTreeNodeKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeTreeNode`},
 		{TransactionKey(roachpb.Key("111"), txnID), fmt.Sprintf(`/Local/Range/"111"/Transaction/addrKey:/id:%q`, txnID)},
 
 		{LocalMax, `/Meta1/""`}, // LocalMax == Meta1Prefix

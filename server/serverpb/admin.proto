@@ -19,12 +19,13 @@ package cockroach.server.serverpb;
 option go_package = "serverpb";
 
 import "cockroach/config/config.proto";
+import "cockroach/storage/engine/enginepb/mvcc.proto";
 import weak "gogoproto/gogo.proto";
 import weak "google/api/annotations.proto";
 
 // ZoneConfigurationLevel indicates, for objects with a Zone Configuration,
 // the object level at which the configuration is defined. This is needed
-// because objects without a specifically indicated Zone Configuration will 
+// because objects without a specifically indicated Zone Configuration will
 // inherit the configuration of their "parent".
 enum ZoneConfigurationLevel {
   UNKNOWN = 0;
@@ -141,6 +142,45 @@ message TableDetailsResponse {
   cockroach.config.ZoneConfig zone_config = 6 [(gogoproto.nullable) = false];
   // The level at which this object's zone configuration is set.
   ZoneConfigurationLevel zone_config_level = 7;
+}
+
+// TableStatsRequest is a request for detailed, computationally expensive
+// information about a table.
+message TableStatsRequest {
+  // database is the database that contains the table we're interested in.
+  string database = 1;
+  // table is the name of the table that we're querying.
+  string table = 2;
+}
+
+// TableStatsResponse contains detailed, computationally expensive information
+// about a table.
+message TableStatsResponse {
+  // range_count is the number of ranges, as determined from a query of range
+  // meta keys.
+  int64 range_count = 1;
+  // replica_count is the number of replicas of any range of this table, as
+  // found by querying nodes which are known to have replicas. When compared
+  // with range_count, this can be used to estimate the current replication
+  // factor of the table.
+  int64 replica_count = 2;
+  // node_count is the number of nodes which contain data for this table, 
+  // according to a query of range meta keys.
+  int64 node_count = 3;
+  // stats is the summation of MVCCStats for all replicas of this table
+  // across the cluster.
+  cockroach.storage.engine.enginepb.MVCCStats stats = 4 [(gogoproto.nullable) = false];
+  // MissingNode represents information on a node which should contain data
+  // for this table, but could not be contacted during this request.
+  message MissingNode {
+    // The ID of the missing node.
+    string node_id = 1 [(gogoproto.customname) = "NodeID"];
+    // The error message that resulted when the query sent to this node failed.
+    string error_message = 2;
+  }
+  // A list of nodes which should contain data for this table (according to
+  // cluster metadata), but could not be contacted during this request.
+  repeated MissingNode missing_nodes = 5 [(gogoproto.nullable) = false];
 }
 
 // UsersRequest requests a list of users.
@@ -262,8 +302,8 @@ enum DrainMode {
     // TODO(tschottdorf): also terminate existing clients in a graceful manner.
     CLIENT = 0;
     // LEADERSHIP instructs the server to gracefully let all its Replicas'
-    // leader leases expire.
-    LEADERSHIP = 1;
+    // range leases expire.
+    LEASES = 1;
 }
 
 // DrainRequest requests the server to enter the specified draining mode. The
@@ -271,8 +311,9 @@ enum DrainMode {
 // all those in 'on'.
 message DrainRequest {
   // These are actually of type DrainMode, but grpc-gateway does not support
-  // proxying enum fields (yet: https://github.com/gengo/grpc-gateway/issues/5)
-  // and it fails in pretty dramatic ways (panics the server).
+  // proxying enum fields (yet:
+  // https://github.com/grpc-ecosystem/grpc-gateway/issues/5) and it fails in
+  // pretty dramatic ways (panics the server).
   repeated int32 on = 1;
   repeated int32 off = 2;
   // When true, terminates the process after the given drain modes have been
@@ -344,6 +385,13 @@ service Admin {
     };
   }
 
+  // Example URL: /_admin/v1/databases/system/tables/ui/stats
+  rpc TableStats(TableStatsRequest) returns (TableStatsResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/databases/{database}/tables/{table}/stats"
+    };
+  }
+
   // Example URLs:
   // - /_admin/v1/events?type=create_table
   // - /_admin/v1/events?type=drop_table&target_id=4
@@ -405,7 +453,7 @@ service Admin {
 
   // Drain puts the node into the specified drain mode(s) and optionally
   // instructs the process to terminate.
-  rpc Drain(DrainRequest) returns (DrainResponse) {
+  rpc Drain(DrainRequest) returns (stream DrainResponse) {
     option (google.api.http) = {
       post: "/_admin/v1/drain"
       body: "*"

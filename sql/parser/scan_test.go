@@ -67,6 +67,9 @@ func TestScanner(t *testing.T) {
 		{`||`, []int{CONCAT}},
 		{`#`, []int{'#'}},
 		{`~`, []int{'~'}},
+		{`!~`, []int{NOT_REGMATCH}},
+		{`~*`, []int{REGIMATCH}},
+		{`!~*`, []int{NOT_REGIMATCH}},
 		{`$1`, []int{PLACEHOLDER}},
 		{`$a`, []int{'$', IDENT}},
 		{`a`, []int{IDENT}},
@@ -96,7 +99,7 @@ func TestScanner(t *testing.T) {
 		{`1e-1`, []int{FCONST}},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var tokens []int
 		for {
 			var lval sqlSymType
@@ -132,7 +135,7 @@ func TestScannerModern(t *testing.T) {
 		{`$1 $foo $select`, []int{PLACEHOLDER, PLACEHOLDER, PLACEHOLDER}},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql, Modern)
 		var tokens []int
 		for {
 			var lval sqlSymType
@@ -169,7 +172,7 @@ foo`, "", "foo"},
 		{`/* /* */`, "unterminated comment", ""},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		present, ok := s.scanComment(&lval)
 		if d.err == "" && (!present || !ok) {
@@ -193,7 +196,7 @@ func TestScanCommentModern(t *testing.T) {
 foo`, "", "foo"},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql, Modern)
 		var lval sqlSymType
 		present, ok := s.scanComment(&lval)
 		if d.err == "" && (!present || !ok) {
@@ -209,7 +212,7 @@ foo`, "", "foo"},
 
 func TestScanKeyword(t *testing.T) {
 	for kwName, kwID := range keywords {
-		s := makeScanner(kwName, Traditional)
+		s := MakeScanner(kwName, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if kwID != id {
@@ -245,7 +248,7 @@ func TestScanNumber(t *testing.T) {
 		{`9223372036854775809`, `9223372036854775809`, ICONST},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if d.id != id {
@@ -267,7 +270,7 @@ func TestScanPlaceholder(t *testing.T) {
 		{`$123`, 123},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if id != PLACEHOLDER {
@@ -342,7 +345,7 @@ world`},
 		{`X'626172'`, `bar`},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		_ = s.Lex(&lval)
 		if d.expected != lval.str {
@@ -378,7 +381,7 @@ world`},
 world'`, `invalid syntax: embedded newline`},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql, Modern)
 		var lval sqlSymType
 		_ = s.Lex(&lval)
 		if d.expected != lval.str {
@@ -410,7 +413,7 @@ func TestScanError(t *testing.T) {
 		{`$9223372036854775809`, "integer value out of range"},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if id != ERROR {

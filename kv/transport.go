@@ -18,18 +18,19 @@
 package kv
 
 import (
-	"fmt"
 	"sort"
 	"time"
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util/envutil"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+	"github.com/rubyist/circuitbreaker"
 	"google.golang.org/grpc"
 )
 
@@ -119,6 +120,9 @@ func grpcTransportFactory(
 	for _, replica := range replicas {
 		conn, err := rpcContext.GRPCDial(replica.NodeDesc.Address.String())
 		if err != nil {
+			if errors.Cause(err) == circuit.ErrBreakerOpen {
+				continue
+			}
 			return nil, err
 		}
 		argsCopy := args
@@ -162,7 +166,7 @@ func (gt *grpcTransport) SendNext(done chan BatchCall) {
 
 	addr := client.remoteAddr
 	if log.V(2) {
-		log.Infof("sending request to %s: %+v", addr, client.args)
+		log.Infof(gt.opts.Context, "sending request to %s: %+v", addr, client.args)
 	}
 
 	if localServer := gt.rpcContext.GetLocalInternalServerForAddr(addr); enableLocalCalls && localServer != nil {
@@ -178,19 +182,14 @@ func (gt *grpcTransport) SendNext(done chan BatchCall) {
 		ctx, cancel := gt.opts.contextWithTimeout()
 		defer cancel()
 
-		c := client.conn
-		for state, err := c.State(); state != grpc.Ready; state, err = c.WaitForStateChange(ctx, state) {
-			if err != nil {
-				done <- BatchCall{Err: err}
-				return
-			}
-			if state == grpc.Shutdown {
-				done <- BatchCall{Err: fmt.Errorf("rpc to %s failed as client connection was closed", addr)}
-				return
+		reply, err := client.client.Batch(ctx, &client.args)
+		if reply != nil {
+			for i := range reply.Responses {
+				if err := reply.Responses[i].GetInner().Verify(client.args.Requests[i].GetInner()); err != nil {
+					log.Error(ctx, err)
+				}
 			}
 		}
-
-		reply, err := client.client.Batch(ctx, &client.args)
 		done <- BatchCall{Reply: reply, Err: err}
 	}()
 }

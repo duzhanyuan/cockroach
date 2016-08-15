@@ -20,15 +20,16 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 func TestShowCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx, _ := createTestServerContext()
-	server, sqlDB, _ := setupWithContext(t, &ctx)
-	defer cleanup(server, sqlDB)
+	params, _ := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
 
 	if _, err := sqlDB.Exec(`
 		CREATE DATABASE d;
@@ -54,11 +55,8 @@ func TestShowCreateTable(t *testing.T) {
 	s STRING NULL,
 	v FLOAT NOT NULL,
 	t TIMESTAMP NULL DEFAULT NOW(),
-	FAMILY "primary" (rowid),
-	FAMILY fam_1_i (i),
-	FAMILY fam_2_s (s),
-	FAMILY fam_3_v (v),
-	FAMILY fam_4_t (t),
+	FAMILY "primary" (i, v, t, rowid),
+	FAMILY fam_1_s (s),
 	CHECK (i > 0)
 )`,
 		},
@@ -74,11 +72,8 @@ func TestShowCreateTable(t *testing.T) {
 	s STRING NULL,
 	v FLOAT NOT NULL,
 	t TIMESTAMP NULL DEFAULT NOW(),
-	FAMILY "primary" (rowid),
-	FAMILY fam_1_i (i),
-	FAMILY fam_2_s (s),
-	FAMILY fam_3_v (v),
-	FAMILY fam_4_t (t),
+	FAMILY "primary" (i, v, t, rowid),
+	FAMILY fam_1_s (s),
 	CHECK (i > 0)
 )`,
 		},
@@ -91,9 +86,8 @@ func TestShowCreateTable(t *testing.T) {
 			expect: `CREATE TABLE %s (
 	i INT NULL,
 	s STRING NULL,
-	FAMILY "primary" (rowid),
-	FAMILY fam_1_i (i),
-	FAMILY fam_2_s (s),
+	FAMILY "primary" (i, rowid),
+	FAMILY fam_1_s (s),
 	CONSTRAINT ck CHECK (i > 0)
 )`,
 		},
@@ -120,11 +114,8 @@ func TestShowCreateTable(t *testing.T) {
 	d DATE NULL,
 	INDEX idx_if (f, i) STORING (s, d),
 	UNIQUE INDEX %[1]s_d_key (d),
-	FAMILY "primary" (rowid),
-	FAMILY fam_1_i (i),
-	FAMILY fam_2_f (f),
-	FAMILY fam_3_s (s),
-	FAMILY fam_4_d (d)
+	FAMILY "primary" (i, f, d, rowid),
+	FAMILY fam_1_s (s)
 )`,
 		},
 		{

@@ -19,6 +19,7 @@ package cliflags
 // AttrsName and others are flag names.
 const (
 	AttrsName             = "attrs"
+	ZoneConfigName        = "file"
 	BackgroundName        = "background"
 	CacheName             = "cache"
 	DatabaseName          = "database"
@@ -33,6 +34,7 @@ const (
 	PasswordName          = "password"
 	PortName              = "port"
 	HTTPPortName          = "http-port"
+	HTTPAddrName          = "http-addr"
 	CACertName            = "ca-cert"
 	CAKeyName             = "ca-key"
 	CertName              = "cert"
@@ -44,6 +46,7 @@ const (
 	FromName              = "from"
 	ToName                = "to"
 	ValuesName            = "values"
+	SizesName             = "sizes"
 	RaftTickIntervalName  = "raft-tick-interval"
 	UndoFreezeClusterName = "undo"
 )

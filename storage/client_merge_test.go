@@ -25,8 +25,7 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
-	"github.com/cockroachdb/cockroach/config"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage"
@@ -57,18 +56,18 @@ func createSplitRanges(store *storage.Store) (*roachpb.RangeDescriptor, *roachpb
 	rangeBDesc := store.LookupReplica([]byte("c"), nil).Desc()
 
 	if bytes.Equal(rangeADesc.StartKey, rangeBDesc.StartKey) {
-		log.Errorf("split ranges keys are equal %q!=%q", rangeADesc.StartKey, rangeBDesc.StartKey)
+		log.Errorf(context.TODO(), "split ranges keys are equal %q!=%q", rangeADesc.StartKey, rangeBDesc.StartKey)
 	}
 
 	return rangeADesc, rangeBDesc, nil
 }
 
-// TestStoreRangeMergeTwoEmptyRanges tries to merge two empty ranges
-// together.
+// TestStoreRangeMergeTwoEmptyRanges tries to merge two empty ranges together.
 func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer config.TestingDisableTableSplits()()
-	store, stopper, _ := createTestStore(t)
+	sCtx := storage.TestStoreContext()
+	sCtx.TestingKnobs.DisableSplitQueue = true
+	store, stopper, _ := createTestStoreWithContext(t, sCtx)
 	defer stopper.Stop()
 
 	if _, _, err := createSplitRanges(store); err != nil {
@@ -83,11 +82,11 @@ func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
 	}
 
 	// Verify the merge by looking up keys from both ranges.
-	rangeA := store.LookupReplica([]byte("a"), nil)
-	rangeB := store.LookupReplica([]byte("c"), nil)
+	replicaA := store.LookupReplica([]byte("a"), nil)
+	replicaB := store.LookupReplica([]byte("c"), nil)
 
-	if !reflect.DeepEqual(rangeA, rangeB) {
-		t.Fatalf("ranges were not merged %+v=%+v", rangeA.Desc(), rangeB.Desc())
+	if !reflect.DeepEqual(replicaA, replicaB) {
+		t.Fatalf("ranges were not merged %s!=%s", replicaA, replicaB)
 	}
 }
 
@@ -95,8 +94,9 @@ func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
 // subsumed range is cleaned up on merge.
 func TestStoreRangeMergeMetadataCleanup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer config.TestingDisableTableSplits()()
-	store, stopper, _ := createTestStore(t)
+	sCtx := storage.TestStoreContext()
+	sCtx.TestingKnobs.DisableSplitQueue = true
+	store, stopper, _ := createTestStoreWithContext(t, sCtx)
 	defer stopper.Stop()
 
 	scan := func(f func(roachpb.KeyValue) (bool, error)) {
@@ -173,8 +173,9 @@ func TestStoreRangeMergeMetadataCleanup(t *testing.T) {
 // each containing data.
 func TestStoreRangeMergeWithData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer config.TestingDisableTableSplits()()
-	store, stopper, _ := createTestStore(t)
+	sCtx := storage.TestStoreContext()
+	sCtx.TestingKnobs.DisableSplitQueue = true
+	store, stopper, _ := createTestStoreWithContext(t, sCtx)
 	defer stopper.Stop()
 
 	content := roachpb.Key("testing!")
@@ -300,8 +301,9 @@ func TestStoreRangeMergeWithData(t *testing.T) {
 // fails.
 func TestStoreRangeMergeLastRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer config.TestingDisableTableSplits()()
-	store, stopper, _ := createTestStore(t)
+	sCtx := storage.TestStoreContext()
+	sCtx.TestingKnobs.DisableSplitQueue = true
+	store, stopper, _ := createTestStoreWithContext(t, sCtx)
 	defer stopper.Stop()
 
 	// Merge last range.
@@ -338,13 +340,13 @@ func TestStoreRangeMergeNonCollocated(t *testing.T) {
 	rangeCDesc := rangeC.Desc()
 
 	if bytes.Equal(rangeADesc.StartKey, rangeBDesc.StartKey) {
-		log.Errorf("split ranges keys are equal %q!=%q", rangeADesc.StartKey, rangeBDesc.StartKey)
+		log.Errorf(context.TODO(), "split ranges keys are equal %q!=%q", rangeADesc.StartKey, rangeBDesc.StartKey)
 	}
 	if bytes.Equal(rangeBDesc.StartKey, rangeCDesc.StartKey) {
-		log.Errorf("split ranges keys are equal %q!=%q", rangeBDesc.StartKey, rangeCDesc.StartKey)
+		log.Errorf(context.TODO(), "split ranges keys are equal %q!=%q", rangeBDesc.StartKey, rangeCDesc.StartKey)
 	}
 	if bytes.Equal(rangeADesc.StartKey, rangeCDesc.StartKey) {
-		log.Errorf("split ranges keys are equal %q!=%q", rangeADesc.StartKey, rangeCDesc.StartKey)
+		log.Errorf(context.TODO(), "split ranges keys are equal %q!=%q", rangeADesc.StartKey, rangeCDesc.StartKey)
 	}
 
 	// Replicate the ranges to different sets of stores. Ranges A and C
@@ -366,8 +368,9 @@ func TestStoreRangeMergeNonCollocated(t *testing.T) {
 // range has stats consistent with recomputations.
 func TestStoreRangeMergeStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer config.TestingDisableTableSplits()()
-	store, stopper, manual := createTestStore(t)
+	sCtx := storage.TestStoreContext()
+	sCtx.TestingKnobs.DisableSplitQueue = true
+	store, stopper, manual := createTestStoreWithContext(t, sCtx)
 	defer stopper.Stop()
 
 	// Split the range.
@@ -424,8 +427,9 @@ func TestStoreRangeMergeStats(t *testing.T) {
 
 func BenchmarkStoreRangeMerge(b *testing.B) {
 	defer tracing.Disable()()
-	defer config.TestingDisableTableSplits()()
-	store, stopper, _ := createTestStore(b)
+	sCtx := storage.TestStoreContext()
+	sCtx.TestingKnobs.DisableSplitQueue = true
+	store, stopper, _ := createTestStoreWithContext(b, sCtx)
 	defer stopper.Stop()
 
 	// Perform initial split of ranges.

@@ -29,6 +29,10 @@ import (
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
+// PrettyPrintTimeseriesKey is a hook for pretty printing a timeseries key. The
+// timeseries key prefix will already have been stripped off.
+var PrettyPrintTimeseriesKey func(key roachpb.Key) string
+
 type dictEntry struct {
 	name   string
 	prefix roachpb.Key
@@ -80,7 +84,7 @@ var (
 					if len(unq) == 0 {
 						return "", Meta1Prefix
 					}
-					return "", RangeMetaKey(mustAddr(RangeMetaKey(mustAddr(
+					return "", RangeMetaKey(MustAddr(RangeMetaKey(MustAddr(
 						roachpb.Key(unq)))))
 				},
 			}},
@@ -96,13 +100,17 @@ var (
 					if len(unq) == 0 {
 						return "", Meta2Prefix
 					}
-					return "", RangeMetaKey(mustAddr(roachpb.Key(unq)))
+					return "", RangeMetaKey(MustAddr(roachpb.Key(unq)))
 				},
 			}},
 		},
 		{name: "/System", start: SystemPrefix, end: SystemMax, entries: []dictEntry{
 			{name: "/StatusNode", prefix: StatusNodePrefix,
 				ppFunc: decodeKeyPrint,
+				psFunc: parseUnsupported,
+			},
+			{name: "/tsd", prefix: TimeseriesPrefix,
+				ppFunc: decodeTimeseriesKey,
 				psFunc: parseUnsupported,
 			},
 		}},
@@ -141,8 +149,10 @@ var (
 		{name: "RaftLastIndex", suffix: LocalRaftLastIndexSuffix},
 		{name: "RangeLastReplicaGCTimestamp", suffix: LocalRangeLastReplicaGCTimestampSuffix},
 		{name: "RangeLastVerificationTimestamp", suffix: LocalRangeLastVerificationTimestampSuffix},
-		{name: "RangeLeaderLease", suffix: LocalRangeLeaderLeaseSuffix},
+		{name: "RangeLease", suffix: LocalRangeLeaseSuffix},
 		{name: "RangeStats", suffix: LocalRangeStatsSuffix},
+		{name: "RangeFrozenStatus", suffix: LocalRangeFrozenStatusSuffix},
+		{name: "RangeLastGC", suffix: LocalRangeLastGCSuffix},
 	}
 
 	rangeSuffixDict = []struct {
@@ -151,7 +161,6 @@ var (
 		atEnd  bool
 	}{
 		{name: "RangeDescriptor", suffix: LocalRangeDescriptorSuffix, atEnd: true},
-		{name: "RangeTreeNode", suffix: localRangeTreeNodeSuffix, atEnd: true},
 		{name: "Transaction", suffix: localTransactionSuffix, atEnd: false},
 	}
 )
@@ -285,7 +294,7 @@ func localRangeIDKeyParse(input string) (remainder string, key roachpb.Key) {
 		// 	return "", nil, err
 		// }
 		remainder = ""
-		key = maker(roachpb.RangeID(rangeID), suffix, roachpb.RKey(detail))
+		key = maker(roachpb.RangeID(rangeID), suffix, detail)
 		return
 	}
 	panic(&errUglifyUnsupported{errors.New("unhandled general range key")})
@@ -408,6 +417,10 @@ func decodeKeyPrint(key roachpb.Key) string {
 	return encoding.PrettyPrintValue(key, "/")
 }
 
+func decodeTimeseriesKey(key roachpb.Key) string {
+	return PrettyPrintTimeseriesKey(key)
+}
+
 // prettyPrintInternal parse key with prefix in keyDict,
 // if the key don't march any prefix in keyDict, return its byte value with quotation and false,
 // or else return its human readable value and true.
@@ -449,7 +462,7 @@ func prettyPrintInternal(key roachpb.Key) (string, bool) {
 // 		/Store/...                                  "\x01s"+...
 //		/RangeID/...                                "\x01s"+[rangeid]
 //			/[rangeid]/AbortCache/[id]                "\x01s"+[rangeid]+"abc-"+[id]
-//			/[rangeid]/RaftLeaderLease                "\x01s"+[rangeid]+"rfll"
+//			/[rangeid]/Lease						  "\x01s"+[rangeid]+"rfll"
 //			/[rangeid]/RaftTombstone                  "\x01s"+[rangeid]+"rftb"
 //			/[rangeid]/RaftHardState						      "\x01s"+[rangeid]+"rfth"
 //			/[rangeid]/RaftAppliedIndex						    "\x01s"+[rangeid]+"rfta"
@@ -461,7 +474,6 @@ func prettyPrintInternal(key roachpb.Key) (string, bool) {
 //			/[rangeid]/RangeStats                     "\x01s"+[rangeid]+"stat"
 //		/Range/...                                  "\x01k"+...
 //			/RangeDescriptor/[key]                    "\x01k"+[key]+"rdsc"
-//			/RangeTreeNode/[key]                      "\x01k"+[key]+"rtn-"
 //			/Transaction/addrKey:[key]/id:[id]				"\x01k"+[key]+"txn-"+[id]
 // /Local/Max                                     "\x02"
 //

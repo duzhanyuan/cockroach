@@ -24,7 +24,8 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/storage/storagebase"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
@@ -52,8 +54,8 @@ import (
 // index record being read.
 func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
 
 	// Create an intent on the meta1 record by writing directly to the
@@ -61,7 +63,9 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	key := testutils.MakeKey(keys.Meta1Prefix, roachpb.KeyMax)
 	now := s.Clock().Now()
 	txn := roachpb.NewTransaction("txn", roachpb.Key("foobar"), 0, enginepb.SERIALIZABLE, now, 0)
-	if err := engine.MVCCPutProto(context.Background(), s.Ctx.Engines[0], nil, key, now, txn, &roachpb.RangeDescriptor{}); err != nil {
+	if err := engine.MVCCPutProto(
+		context.Background(), s.(*server.TestServer).Ctx.Engines[0],
+		nil, key, now, txn, &roachpb.RangeDescriptor{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -81,7 +85,9 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 // key range at the given keys. Returns the test server and client.
 // The caller is responsible for stopping the server and
 // closing the client.
-func setupMultipleRanges(t *testing.T, ts server.TestServer, splitAt ...string) *client.DB {
+func setupMultipleRanges(
+	t *testing.T, ts serverutils.TestServerInterface, splitAt ...string,
+) *client.DB {
 	db := createTestClient(t, ts.Stopper(), ts.ServingAddr())
 
 	// Split the keyspace at the given keys.
@@ -97,59 +103,116 @@ func setupMultipleRanges(t *testing.T, ts server.TestServer, splitAt ...string) 
 
 var errInfo = testutils.MakeCaller(3, 2)
 
-// checkKeysInKVs verifies that a KeyValue slice contains the given keys.
-func checkKeysInKVs(t *testing.T, kvs []client.KeyValue, keys ...string) {
-	if len(keys) != len(kvs) {
-		t.Errorf("%s: expected %d scan results, got %d", errInfo(), len(keys), len(kvs))
-		return
-	}
-	for i, kv := range kvs {
-		expKey := keys[i]
-		if key := string(kv.Key); key != keys[i] {
-			t.Errorf("%s: expected scan key %d to be %q; got %q", errInfo(), i, expKey, key)
-		}
-	}
-}
-
-func checkScanResults(t *testing.T, results []client.Result, expResults [][]string) {
+// checks the keys returned from a Scan/ReverseScan.
+func checkSpanResults(t *testing.T, spans [][]string, results []client.Result, expResults [][]string, expCount int) {
 	if len(expResults) != len(results) {
 		t.Fatalf("only got %d results, wanted %d", len(expResults), len(results))
 	}
+	// Ensure all the keys returned align properly with what is expected.
+	count := 0
 	for i, res := range results {
-		checkKeysInKVs(t, res.Rows, expResults[i]...)
-	}
-}
-
-func TestMultiRangeBatchBoundedScans(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
-	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
-	for _, key := range []string{"a", "aa", "aaa", "b", "bb", "cc", "d", "dd", "ff"} {
-		if err := db.Put(key, "value"); err != nil {
-			t.Fatal(err)
+		count += len(res.Rows)
+		for j, kv := range res.Rows {
+			if key, expKey := string(kv.Key), expResults[i][j]; key != expKey {
+				t.Errorf("%s: expected scan key (%d, %d) to be %q; got %q", errInfo(), i, j, expKey, key)
+			}
+		}
+		// Check ResumeSpan if the request hasn't been processed.
+		if len(res.Rows) == 0 {
+			// The row was not read; the resume span == request span.
+			if key, expKey := string(res.ResumeSpan.Key), spans[i][0]; key != expKey {
+				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
+			if key, expKey := string(res.ResumeSpan.EndKey), spans[i][1]; key != expKey {
+				t.Errorf("%s: expected resume endkey %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
 		}
 	}
-
-	b := db.NewBatch()
-	b.Scan("aaa", "dd", 3)
-	b.Scan("a", "z", 2)
-	b.Scan("cc", "ff", 3)
-	if err := db.Run(b); err != nil {
-		t.Fatal(err)
+	// The bound was respected.
+	if count != expCount {
+		t.Errorf("count = %d, expCount = %d", count, expCount)
 	}
-
-	checkScanResults(t, b.Results, [][]string{
-		{"aaa", "b", "bb"},
-		{"a", "aa"},
-		{"cc", "d", "dd"},
-	})
 }
 
-func TestMultiRangeBoundedBatch(t *testing.T) {
+// checks ResumeSpan returned in a ScanResponse.
+func checkResumeSpanScanResults(t *testing.T, spans [][]string, results []client.Result, expResults [][]string, expCount int) {
+	for i, res := range results {
+		rowLen := len(res.Rows)
+		// Check ResumeSpan when request has been processed.
+		if rowLen > 0 {
+			if rowLen == len(expResults[i]) {
+				// The key can be empty once the entire response is seen. It
+				// is not guaranteed to be empty.
+				if res.ResumeSpan.Key == nil {
+					continue
+				}
+			}
+			// The next start key is always greater than or equal to the last
+			// key.Next() seen. It is either set to last key.Next, or the end
+			// key of the range that the last key was a part of.
+			if key, expKey := string(res.ResumeSpan.Key), string(roachpb.Key(expResults[i][rowLen-1]).Next()); key < expKey {
+				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
+		} else {
+			// The row was not read; the resume span key <= first seen key
+			if key, expKey := string(res.ResumeSpan.Key), expResults[i][0]; key > expKey {
+				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
+		}
+		// The EndKey is untouched.
+		if key, expKey := string(res.ResumeSpan.EndKey), spans[i][1]; key != expKey {
+			t.Errorf("%s: expected resume endkey %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+		}
+	}
+}
+
+// check ResumeSpan returned in a ReverseScanResponse.
+func checkResumeSpanReverseScanResults(t *testing.T, spans [][]string, results []client.Result, expResults [][]string, expCount int) {
+	for i, res := range results {
+		// Check ResumeSpan when request has been processed.
+		rowLen := len(res.Rows)
+		if rowLen > 0 {
+			// The key can be empty once the entire response is seen.
+			if rowLen == len(expResults[i]) {
+				if res.ResumeSpan.Key == nil {
+					continue
+				}
+			}
+			// The next end key is always less than or equal to the last key
+			// seen.
+			if key, expKey := string(res.ResumeSpan.EndKey), expResults[i][rowLen-1]; key > expKey {
+				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
+		} else {
+			// The row was not read; the resume span endkey >= first seen key.
+			if key, expKey := string(res.ResumeSpan.EndKey), expResults[i][0]; key < expKey {
+				t.Errorf("%s: expected resume endkey %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
+		}
+		// The Key is untouched.
+		if key, expKey := string(res.ResumeSpan.Key), spans[i][0]; key != expKey {
+			t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+		}
+	}
+}
+
+// check an entire scan result including the ResumeSpan.
+func checkScanResults(t *testing.T, spans [][]string, results []client.Result, expResults [][]string, expCount int) {
+	checkSpanResults(t, spans, results, expResults, expCount)
+	checkResumeSpanScanResults(t, spans, results, expResults, expCount)
+}
+
+// check an entire reverse scan result including the ResumeSpan.
+func checkReverseScanResults(t *testing.T, spans [][]string, results []client.Result, expResults [][]string, expCount int) {
+	checkSpanResults(t, spans, results, expResults, expCount)
+	checkResumeSpanReverseScanResults(t, spans, results, expResults, expCount)
+}
+
+// Tests multiple scans across many ranges with multiple bounds.
+func TestMultiRangeBoundedBatchScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
 	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3"} {
@@ -158,33 +221,395 @@ func TestMultiRangeBoundedBatch(t *testing.T) {
 		}
 	}
 
-	for bound := 1; bound <= 20; bound++ {
-		b := db.NewBatch()
-		b.Header.MaxScanResults = int64(bound)
+	// These are the expected results if there is no bound.
+	expResults := [][]string{
+		{"a1", "a2", "a3", "b1", "b2"},
+		{"b1", "b2", "c1"},
+		{"c1", "c2", "d1", "f1", "f2", "f3"},
+		{"f2"},
+	}
+	maxExpCount := 0
+	for _, res := range expResults {
+		maxExpCount += len(res)
+	}
 
-		b.Scan("a", "c", 0)
-		b.Scan("b", "f", 3)
-		b.Scan("c", "g", 0)
-		b.Scan("f1a", "g", 1)
+	for bound := 1; bound <= 20; bound++ {
+		b := &client.Batch{}
+		b.Header.MaxSpanRequestKeys = int64(bound)
+
+		spans := [][]string{{"a", "c"}, {"b", "c2"}, {"c", "g"}, {"f1a", "f2a"}}
+		for _, span := range spans {
+			b.Scan(span[0], span[1])
+		}
 		if err := db.Run(b); err != nil {
 			t.Fatal(err)
 		}
 
-		// These are the expected results if there is no bound; we trim them below.
-		expResults := [][]string{
-			{"a1", "a2", "a3", "b1", "b2"},
-			{"b1", "b2", "c1"},
-			{"c1", "c2", "d1", "f1", "f2", "f3"},
-			{"f2"},
+		expCount := maxExpCount
+		if bound < maxExpCount {
+			expCount = bound
 		}
-		rem := bound
-		for i := range expResults {
-			if rem < len(expResults[i]) {
-				expResults[i] = expResults[i][:rem]
+		checkScanResults(t, spans, b.Results, expResults, expCount)
+
+		// Re-query using the resume spans that were returned; check that all
+		// spans are read properly.
+		if bound < maxExpCount {
+			newB := &client.Batch{}
+			for _, res := range b.Results {
+				if res.ResumeSpan.Key != nil {
+					newB.Scan(res.ResumeSpan.Key, res.ResumeSpan.EndKey)
+				}
 			}
-			rem -= len(expResults[i])
+			if err := db.Run(newB); err != nil {
+				t.Fatal(err)
+			}
+			// Add the results to the previous results.
+			j := 0
+			for i, res := range b.Results {
+				if res.ResumeSpan.Key != nil {
+					b.Results[i].Rows = append(b.Results[i].Rows, newB.Results[j].Rows...)
+					b.Results[i].ResumeSpan = newB.Results[j].ResumeSpan
+					j++
+				}
+			}
+			// Check that the Scan results contain all the expected results.
+			checkScanResults(t, spans, b.Results, expResults, maxExpCount)
 		}
-		checkScanResults(t, b.Results, expResults)
+	}
+}
+
+// Tests multiple reverse scans across many ranges with multiple bounds.
+func TestMultiRangeBoundedBatchReverseScan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+
+	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
+	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3"} {
+		if err := db.Put(key, "value"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// These are the expected results if there is no bound
+	expResults := [][]string{
+		{"b2", "b1", "a3", "a2", "a1"},
+		{"c1", "b2", "b1"},
+		{"f3", "f2", "f1", "d1", "c2", "c1"},
+		{"f2"},
+	}
+	maxExpCount := 0
+	for _, res := range expResults {
+		maxExpCount += len(res)
+	}
+
+	for bound := 1; bound <= 20; bound++ {
+		b := &client.Batch{}
+		b.Header.MaxSpanRequestKeys = int64(bound)
+
+		spans := [][]string{{"a", "c"}, {"b", "c2"}, {"c", "g"}, {"f1a", "f2a"}}
+		for _, span := range spans {
+			b.ReverseScan(span[0], span[1])
+		}
+		if err := db.Run(b); err != nil {
+			t.Fatal(err)
+		}
+
+		expCount := maxExpCount
+		if bound < maxExpCount {
+			expCount = bound
+		}
+		checkReverseScanResults(t, spans, b.Results, expResults, expCount)
+
+		// Re-query using the resume spans that were returned; check that all
+		// spans are read properly.
+		if bound < maxExpCount {
+			newB := &client.Batch{}
+			for _, res := range b.Results {
+				if res.ResumeSpan.Key != nil {
+					newB.ReverseScan(res.ResumeSpan.Key, res.ResumeSpan.EndKey)
+				}
+			}
+			if err := db.Run(newB); err != nil {
+				t.Fatal(err)
+			}
+			// Add the results to the previous results.
+			j := 0
+			for i, res := range b.Results {
+				if res.ResumeSpan.Key != nil {
+					b.Results[i].Rows = append(b.Results[i].Rows, newB.Results[j].Rows...)
+					b.Results[i].ResumeSpan = newB.Results[j].ResumeSpan
+					j++
+				}
+			}
+			// Check that the ReverseScan results contain all the expected
+			// results.
+			checkReverseScanResults(t, spans, b.Results, expResults, maxExpCount)
+		}
+	}
+}
+
+// TestMultiRangeBoundedBatchScanUnsortedOrder runs two non-overlapping
+// scan requests out of order and shows how the batch response can
+// contain two partial responses.
+func TestMultiRangeBoundedBatchScanUnsortedOrder(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+
+	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
+	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "b3", "b4", "b5", "c1", "c2", "d1", "f1", "f2", "f3"} {
+		if err := db.Put(key, "value"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bound := 6
+	b := &client.Batch{}
+	b.Header.MaxSpanRequestKeys = int64(bound)
+	// Two non-overlapping requests out of order.
+	spans := [][]string{{"b3", "c2"}, {"a", "b3"}}
+	for _, span := range spans {
+		b.Scan(span[0], span[1])
+	}
+	if err := db.Run(b); err != nil {
+		t.Fatal(err)
+	}
+	// See incomplete results for the two requests.
+	expResults := [][]string{
+		{"b3", "b4", "b5"},
+		{"a1", "a2", "a3"},
+	}
+	checkScanResults(t, spans, b.Results, expResults, bound)
+}
+
+// TestMultiRangeBoundedBatchScanSortedOverlapping runs two overlapping
+// ordered (by start key) scan requests, and shows how the batch response can
+// contain two partial responses.
+func TestMultiRangeBoundedBatchScanSortedOverlapping(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+
+	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
+	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3"} {
+		if err := db.Put(key, "value"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bound := 6
+	b := &client.Batch{}
+	b.Header.MaxSpanRequestKeys = int64(bound)
+	// Two ordered overlapping requests.
+	spans := [][]string{{"a", "d"}, {"b", "g"}}
+	for _, span := range spans {
+		b.Scan(span[0], span[1])
+	}
+	if err := db.Run(b); err != nil {
+		t.Fatal(err)
+	}
+	// See incomplete results for the two requests.
+	expResults := [][]string{
+		{"a1", "a2", "a3", "b1", "b2"},
+		{"b1"},
+	}
+	checkScanResults(t, spans, b.Results, expResults, bound)
+}
+
+// check ResumeSpan in the DelRange results.
+func checkResumeSpanDelRangeResults(t *testing.T, spans [][]string, results []client.Result, expResults [][]string, expCount int) {
+	for i, res := range results {
+		// Check ResumeSpan when request has been processed.
+		rowLen := len(res.Keys)
+		if rowLen > 0 {
+			// The key can be empty once the entire span has been deleted.
+			if rowLen == len(expResults[i]) {
+				if res.ResumeSpan.Key == nil && res.ResumeSpan.EndKey == nil {
+					// Done.
+					continue
+				}
+			}
+			// The next start key is always greater than the last key seen.
+			if key, expKey := string(res.ResumeSpan.Key), expResults[i][rowLen-1]; key <= expKey {
+				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
+		} else {
+			// The request was not processed; the resume span key <= first seen key.
+			if key, expKey := string(res.ResumeSpan.Key), expResults[i][0]; key > expKey {
+				t.Errorf("%s: expected resume key %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+			}
+		}
+		// The EndKey is untouched.
+		if key, expKey := string(res.ResumeSpan.EndKey), spans[i][1]; key != expKey {
+			t.Errorf("%s: expected resume endkey %d, %d to be %q; got %q", errInfo(), i, expCount, expKey, key)
+		}
+	}
+}
+
+// Tests a batch of bounded DelRange() requests.
+func TestMultiRangeBoundedBatchDelRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+
+	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f", "g", "h")
+
+	// These are the expected results if there is no bound.
+	expResults := [][]string{
+		{"a1", "a2", "a3", "b1", "b2"},
+		{"c1", "c2", "d1"},
+		{"g1", "g2"},
+	}
+	maxExpCount := 0
+	for _, res := range expResults {
+		maxExpCount += len(res)
+	}
+
+	for bound := 1; bound <= 20; bound++ {
+		// Initialize all keys.
+		for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3", "g1", "g2", "h1"} {
+			if err := db.Put(key, "value"); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		b := &client.Batch{}
+		b.Header.MaxSpanRequestKeys = int64(bound)
+		spans := [][]string{{"a", "c"}, {"c", "f"}, {"g", "h"}}
+		for _, span := range spans {
+			b.DelRange(span[0], span[1], true)
+		}
+		if err := db.Run(b); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(expResults) != len(b.Results) {
+			t.Fatalf("bound: %d, only got %d results, wanted %d", bound, len(expResults), len(b.Results))
+		}
+		expCount := maxExpCount
+		if bound < maxExpCount {
+			expCount = bound
+		}
+		rem := expCount
+		for i, res := range b.Results {
+			// Verify that the KeyValue slice contains the given keys.
+			rem -= len(res.Keys)
+			for j, key := range res.Keys {
+				if expKey := expResults[i][j]; string(key) != expKey {
+					t.Errorf("%s: expected scan key %d, %d to be %q; got %q", errInfo(), i, j, expKey, key)
+				}
+			}
+		}
+		if rem != 0 {
+			t.Errorf("expected %d keys, got %d", bound, expCount-rem)
+		}
+		checkResumeSpanDelRangeResults(t, spans, b.Results, expResults, expCount)
+	}
+
+}
+
+// Test that a bounded DelRange() request that gets terminated at a range
+// boundary uses the range boundary as the start key in the response
+// ResumeSpan.
+func TestMultiRangeBoundedBatchDelRangeBoundary(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+
+	db := setupMultipleRanges(t, s, "a", "b")
+	// Check that a
+	for _, key := range []string{"a1", "a2", "a3", "b1", "b2"} {
+		if err := db.Put(key, "value"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	b := &client.Batch{}
+	b.Header.MaxSpanRequestKeys = 3
+	b.DelRange("a", "c", true)
+	if err := db.Run(b); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Results) != 1 {
+		t.Fatalf("%d results returned", len(b.Results))
+	}
+	if string(b.Results[0].ResumeSpan.Key) != "b" || string(b.Results[0].ResumeSpan.EndKey) != "c" {
+		t.Fatalf("received ResumeSpan %+v", b.Results[0].ResumeSpan)
+	}
+
+	b = &client.Batch{}
+	b.Header.MaxSpanRequestKeys = 1
+	b.DelRange("b", "c", true)
+	if err := db.Run(b); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Results) != 1 {
+		t.Fatalf("%d results returned", len(b.Results))
+	}
+	if string(b.Results[0].ResumeSpan.Key) != "b2" || string(b.Results[0].ResumeSpan.EndKey) != "c" {
+		t.Fatalf("received ResumeSpan %+v", b.Results[0].ResumeSpan)
+	}
+}
+
+// Tests a batch of bounded DelRange() requests deleting key ranges that
+// overlap.
+func TestMultiRangeBoundedBatchDelRangeOverlappingKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+
+	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
+
+	expResults := [][]string{
+		{"a1", "a2", "a3", "b1", "b2"},
+		{"b3", "c1", "c2"},
+		{"d1", "f1", "f2"},
+		{"f3"},
+	}
+	maxExpCount := 0
+	for _, res := range expResults {
+		maxExpCount += len(res)
+	}
+
+	for bound := 1; bound <= 20; bound++ {
+		for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "b3", "c1", "c2", "d1", "f1", "f2", "f3"} {
+			if err := db.Put(key, "value"); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		b := &client.Batch{}
+		b.Header.MaxSpanRequestKeys = int64(bound)
+		spans := [][]string{{"a", "b3"}, {"b", "d"}, {"c", "f2a"}, {"f1a", "g"}}
+		for _, span := range spans {
+			b.DelRange(span[0], span[1], true)
+		}
+		if err := db.Run(b); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(expResults) != len(b.Results) {
+			t.Fatalf("bound: %d, only got %d results, wanted %d", bound, len(expResults), len(b.Results))
+		}
+		expCount := maxExpCount
+		if bound < maxExpCount {
+			expCount = bound
+		}
+		rem := expCount
+		for i, res := range b.Results {
+			// Verify that the KeyValue slice contains the given keys.
+			rem -= len(res.Keys)
+			for j, key := range res.Keys {
+				if expKey := expResults[i][j]; string(key) != expKey {
+					t.Errorf("%s: expected scan key %d, %d to be %q; got %q", errInfo(), i, j, expKey, key)
+				}
+			}
+		}
+		if rem != 0 {
+			t.Errorf("expected %d keys, got %d", bound, expCount-rem)
+		}
+		checkResumeSpanDelRangeResults(t, spans, b.Results, expResults, expCount)
 	}
 }
 
@@ -193,13 +618,13 @@ func TestMultiRangeBoundedBatch(t *testing.T) {
 // truncation. In that case, the request is skipped.
 func TestMultiRangeEmptyAfterTruncate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := setupMultipleRanges(t, s, "c", "d")
 
 	// Delete the keys within a transaction. The range [c,d) doesn't have
 	// any active requests.
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		b := txn.NewBatch()
 		b.DelRange("a", "b", false)
 		b.DelRange("e", "f", false)
@@ -209,12 +634,29 @@ func TestMultiRangeEmptyAfterTruncate(t *testing.T) {
 	}
 }
 
+// TestMultiRequestBatchWithFwdAndReverseRequests are disallowed.
+func TestMultiRequestBatchWithFwdAndReverseRequests(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	db := setupMultipleRanges(t, s, "a", "b")
+	b := &client.Batch{}
+	b.Header.MaxSpanRequestKeys = 100
+	b.Scan("a", "b")
+	b.ReverseScan("a", "b")
+	if err := db.Run(b); !testutils.IsError(
+		err, "batch with limit contains both forward and reverse scans",
+	) {
+		t.Fatal(err)
+	}
+}
+
 // TestMultiRangeScanReverseScanDeleteResolve verifies that Scan, ReverseScan,
 // DeleteRange and ResolveIntentRange work across ranges.
 func TestMultiRangeScanReverseScanDeleteResolve(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := setupMultipleRanges(t, s, "b")
 
 	// Write keys before, at, and after the split key.
@@ -239,7 +681,7 @@ func TestMultiRangeScanReverseScanDeleteResolve(t *testing.T) {
 
 	// Delete the keys within a transaction. Implicitly, the intents are
 	// resolved via ResolveIntentRange upon completion.
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		b := txn.NewBatch()
 		b.DelRange("a", "d", false)
 		return txn.CommitInBatch(b)
@@ -268,8 +710,8 @@ func TestMultiRangeScanReverseScanDeleteResolve(t *testing.T) {
 func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := setupMultipleRanges(t, s, "b")
 
 	// Write keys "a" and "b", the latter of which is the first key in the
@@ -283,7 +725,7 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 			t.Fatal(err)
 		}
 		ts[i] = s.Clock().Now()
-		log.Infof("%d: %s %d", i, key, ts[i])
+		log.Infof(context.TODO(), "%d: %s %d", i, key, ts[i])
 		if i == 0 {
 			util.SucceedsSoon(t, func() error {
 				// Enforce that when we write the second key, it's written
@@ -303,12 +745,12 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 	// OpRequiresTxnError. We set the local clock to the timestamp of
 	// just above the first key to verify it's used to read only key "a".
 	for i, request := range []roachpb.Request{
-		roachpb.NewScan(roachpb.Key("a"), roachpb.Key("c"), 0),
-		roachpb.NewReverseScan(roachpb.Key("a"), roachpb.Key("c"), 0),
+		roachpb.NewScan(roachpb.Key("a"), roachpb.Key("c")),
+		roachpb.NewReverseScan(roachpb.Key("a"), roachpb.Key("c")),
 	} {
 		manual := hlc.NewManualClock(ts[0].WallTime + 1)
 		clock := hlc.NewClock(manual.UnixNano)
-		ds := kv.NewDistSender(&kv.DistSenderContext{Clock: clock, RPCContext: s.RPCContext()}, s.Gossip())
+		ds := kv.NewDistSender(&kv.DistSenderConfig{Clock: clock, RPCContext: s.RPCContext()}, s.(*server.TestServer).Gossip())
 
 		reply, err := client.SendWrappedWith(ds, nil, roachpb.Header{
 			ReadConsistency: roachpb.INCONSISTENT,
@@ -336,7 +778,7 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 	}
 }
 
-func initReverseScanTestEnv(s server.TestServer, t *testing.T) *client.DB {
+func initReverseScanTestEnv(s serverutils.TestServerInterface, t *testing.T) *client.DB {
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
 
 	// Set up multiple ranges:
@@ -360,8 +802,8 @@ func initReverseScanTestEnv(s server.TestServer, t *testing.T) *client.DB {
 // on a single range.
 func TestSingleRangeReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := initReverseScanTestEnv(s, t)
 
 	// Case 1: Request.EndKey is in the middle of the range.
@@ -370,6 +812,12 @@ func TestSingleRangeReverseScan(t *testing.T) {
 	} else if l := len(rows); l != 2 {
 		t.Errorf("expected 2 rows; got %d", l)
 	}
+	if rows, err := db.ReverseScan("b", "d", 1); err != nil {
+		t.Fatalf("unexpected error on ReverseScan: %s", err)
+	} else if l := len(rows); l != 1 {
+		t.Errorf("expected 1 rows; got %d", l)
+	}
+
 	// Case 2: Request.EndKey is equal to the EndKey of the range.
 	if rows, pErr := db.ReverseScan("e", "g", 0); pErr != nil {
 		t.Fatalf("unexpected error on ReverseScan: %s", pErr)
@@ -398,8 +846,8 @@ func TestSingleRangeReverseScan(t *testing.T) {
 // across multiple ranges.
 func TestMultiRangeReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := initReverseScanTestEnv(s, t)
 
 	// Case 1: Request.EndKey is in the middle of the range.
@@ -407,6 +855,11 @@ func TestMultiRangeReverseScan(t *testing.T) {
 		t.Fatalf("unexpected error on ReverseScan: %s", pErr)
 	} else if l := len(rows); l != 3 {
 		t.Errorf("expected 3 rows; got %d", l)
+	}
+	if rows, pErr := db.ReverseScan("a", "d", 2); pErr != nil {
+		t.Fatalf("unexpected error on ReverseScan: %s", pErr)
+	} else if l := len(rows); l != 2 {
+		t.Errorf("expected 2 rows; got %d", l)
 	}
 	// Case 2: Request.EndKey is equal to the EndKey of the range.
 	if rows, pErr := db.ReverseScan("d", "g", 0); pErr != nil {
@@ -420,8 +873,8 @@ func TestMultiRangeReverseScan(t *testing.T) {
 // across multiple ranges while range splits and merges happen.
 func TestReverseScanWithSplitAndMerge(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := initReverseScanTestEnv(s, t)
 
 	// Case 1: An encounter with a range split.
@@ -451,9 +904,9 @@ func TestReverseScanWithSplitAndMerge(t *testing.T) {
 
 func TestBadRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
-	defer s.Stop()
 
 	// Write key "a".
 	if err := db.Put("a", "value"); err != nil {
@@ -482,8 +935,8 @@ func TestBadRequest(t *testing.T) {
 // higher-level version of TestSequenceCacheShouldCache.
 func TestNoSequenceCachePutOnRangeMismatchError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := setupMultipleRanges(t, s, "b", "c")
 
 	// The requests in the transaction below will be chunked and
@@ -499,7 +952,7 @@ func TestNoSequenceCachePutOnRangeMismatchError(t *testing.T) {
 	//    same replica.
 	// 5) The command succeeds since the sequence cache has not yet been updated.
 	epoch := 0
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		epoch++
 		b := txn.NewBatch()
 		b.Put("a", "val")
@@ -538,10 +991,10 @@ func TestPropagateTxnOnError(t *testing.T) {
 			}
 			return nil
 		}
-	ctx := server.MakeTestContext()
-	ctx.TestingKnobs.Store = &storeKnobs
-	s := server.StartTestServerWithContext(t, &ctx)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t,
+		base.TestServerArgs{Knobs: base.TestingKnobs{Store: &storeKnobs}})
+	defer s.Stopper().Stop()
+
 	db := setupMultipleRanges(t, s, "b")
 
 	// Set the initial value on the target key "b".
@@ -555,7 +1008,7 @@ func TestPropagateTxnOnError(t *testing.T) {
 	// get a ReadWithinUncertaintyIntervalError and the txn will be
 	// retried.
 	epoch := 0
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		epoch++
 		if epoch >= 2 {
 			// Writing must be true since we ran the BeginTransaction command.
@@ -616,8 +1069,8 @@ func assertTransactionPushErrorWithTxnIDSet(t *testing.T, e error) *uuid.UUID {
 // TransactionPushError.
 func TestPropagateTxnOnPushError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 	db := setupMultipleRanges(t, s, "b")
 
 	waitForWriteIntent := make(chan struct{})
@@ -629,17 +1082,17 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 	// Create a goroutine that creates a write intent and waits until
 	// another txn created in this test is restarted.
 	go func() {
-		if err := db.Txn(func(txn *client.Txn) error {
+		if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 			// Set high priority so that the intent will not be pushed.
 			txn.InternalSetPriority(highPriority)
-			log.Infof("Creating a write intent with high priority")
+			log.Infof(context.TODO(), "Creating a write intent with high priority")
 			if err := txn.Put(key, "val"); err != nil {
 				return err
 			}
 			close(waitForWriteIntent)
 			// Wait until another txn in this test is
 			// restarted by a push txn error.
-			log.Infof("Waiting for the txn restart")
+			log.Infof(context.TODO(), "Waiting for the txn restart")
 			<-waitForTxnRestart
 			return txn.CommitInBatch(txn.NewBatch())
 		}); err != nil {
@@ -649,7 +1102,7 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 	}()
 
 	// Wait until a write intent is created by the above goroutine.
-	log.Infof("Waiting for the write intent creation")
+	log.Infof(context.TODO(), "Waiting for the write intent creation")
 	<-waitForWriteIntent
 
 	// The transaction below is restarted exactly once. The restart is
@@ -658,7 +1111,7 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 	// iteration.
 	epoch := 0
 	var txnID *uuid.UUID
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 		// Set low priority so that a write from this txn will not push others.
 		txn.InternalSetPriority(lowPriority)
 
@@ -667,7 +1120,7 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 		if epoch == 2 {
 			close(waitForTxnRestart)
 			// Wait until the txn created by the goroutine is committed.
-			log.Infof("Waiting for the txn commit")
+			log.Infof(context.TODO(), "Waiting for the txn commit")
 			<-waitForTxnCommit
 			if !roachpb.TxnIDEqual(txn.Proto.ID, txnID) {
 				t.Errorf("txn ID is not propagated; got %s", txn.Proto.ID)
@@ -690,7 +1143,7 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 		if epoch == 1 {
 			// Wait for the completion of the goroutine to see if it successfully commits the txn.
 			close(waitForTxnRestart)
-			log.Infof("Waiting for the txn commit")
+			log.Infof(context.TODO(), "Waiting for the txn commit")
 			<-waitForTxnCommit
 		}
 	}
@@ -709,11 +1162,9 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 // should be willing to get rid of it.
 func TestRequestToUninitializedRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.TestServer{StoresPerNode: 2}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Could not start server: %v", err)
-	}
-	defer s.Stop()
+	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{StoresPerNode: 2})
+	defer srv.Stopper().Stop()
+	s := srv.(*server.TestServer)
 
 	// Choose a range ID that is much larger than any that would be
 	// created by initial splits.
@@ -756,7 +1207,7 @@ func TestRequestToUninitializedRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := storage.RaftMessageRequest{
-		GroupID:     rangeID,
+		RangeID:     rangeID,
 		ToReplica:   replica1,
 		FromReplica: replica2,
 		Message: raftpb.Message{
@@ -786,7 +1237,7 @@ func TestRequestToUninitializedRange(t *testing.T) {
 	// bogus range. The DistSender needs to be in scope for its own
 	// MockRangeDescriptorDB closure.
 	var sender *kv.DistSender
-	sender = kv.NewDistSender(&kv.DistSenderContext{
+	sender = kv.NewDistSender(&kv.DistSenderConfig{
 		Clock:      s.Clock(),
 		RPCContext: s.RPCContext(),
 		RangeDescriptorDB: kv.MockRangeDescriptorDB(

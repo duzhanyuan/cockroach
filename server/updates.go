@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -99,7 +100,7 @@ func (s *Server) PeriodicallyCheckForUpdates() {
 			jitter := rand.Intn(updateCheckJitterSeconds) - updateCheckJitterSeconds/2
 			wait = wait + (time.Duration(jitter) * time.Second)
 			select {
-			case <-s.stopper.ShouldDrain():
+			case <-s.stopper.ShouldQuiesce():
 				return
 			case <-time.After(wait):
 			}
@@ -122,7 +123,7 @@ func (s *Server) maybeCheckForUpdates() time.Duration {
 func (s *Server) maybeRunPeriodicCheck(op string, key roachpb.Key, f func()) time.Duration {
 	resp, err := s.db.Get(key)
 	if err != nil {
-		log.Infof("Error reading %s time: %v", op, err)
+		log.Infof(context.TODO(), "Error reading %s time: %v", op, err)
 		return updateCheckRetryFrequency
 	}
 
@@ -132,7 +133,7 @@ func (s *Server) maybeRunPeriodicCheck(op string, key roachpb.Key, f func()) tim
 	if resp.Exists() {
 		whenToCheck, pErr := resp.Value.GetTime()
 		if pErr != nil {
-			log.Warningf("Error decoding %s time: %v", op, err)
+			log.Warningf(context.TODO(), "Error decoding %s time: %v", op, err)
 			return updateCheckRetryFrequency
 		} else if delay := whenToCheck.Sub(timeutil.Now()); delay > 0 {
 			return delay
@@ -141,17 +142,17 @@ func (s *Server) maybeRunPeriodicCheck(op string, key roachpb.Key, f func()) tim
 		nextRetry := whenToCheck.Add(updateCheckRetryFrequency)
 		if err := s.db.CPut(key, nextRetry, whenToCheck); err != nil {
 			if log.V(2) {
-				log.Infof("Could not set next version check time (maybe another node checked?): %v", err)
+				log.Infof(context.TODO(), "Could not set next version check time (maybe another node checked?): %v", err)
 			}
 			return updateCheckRetryFrequency
 		}
 	} else {
-		log.Infof("No previous %s time.", op)
+		log.Infof(context.TODO(), "No previous %s time.", op)
 		nextRetry := timeutil.Now().Add(updateCheckRetryFrequency)
 		// CPut with `nil` prev value to assert that no other node has checked.
 		if err := s.db.CPut(key, nextRetry, nil); err != nil {
 			if log.V(2) {
-				log.Infof("Could not set %s time (maybe another node checked?): %v", op, err)
+				log.Infof(context.TODO(), "Could not set %s time (maybe another node checked?): %v", op, err)
 			}
 			return updateCheckRetryFrequency
 		}
@@ -160,7 +161,7 @@ func (s *Server) maybeRunPeriodicCheck(op string, key roachpb.Key, f func()) tim
 	f()
 
 	if err := s.db.Put(key, timeutil.Now().Add(updateCheckFrequency)); err != nil {
-		log.Infof("Error updating %s time: %v", op, err)
+		log.Infof(context.TODO(), "Error updating %s time: %v", op, err)
 	}
 	return updateCheckFrequency
 }
@@ -176,11 +177,18 @@ func (s *Server) checkForUpdates() {
 		// This is probably going to be relatively common in production
 		// environments where network access is usually curtailed.
 		if log.V(2) {
-			log.Warning("Error checking for updates: ", err)
+			log.Warning(context.TODO(), "Failed to check for updates: ", err)
 		}
 		return
 	}
 	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		b, err := ioutil.ReadAll(res.Body)
+		log.Warningf(context.TODO(), "Failed to check for updates: status: %s, body: %s, error: %v",
+			res.Status, b, err)
+		return
+	}
 
 	decoder := json.NewDecoder(res.Body)
 	r := struct {
@@ -189,22 +197,22 @@ func (s *Server) checkForUpdates() {
 
 	err = decoder.Decode(&r)
 	if err != nil && err != io.EOF {
-		log.Warning("Error decoding updates info: ", err)
+		log.Warning(context.TODO(), "Error decoding updates info: ", err)
 		return
 	}
 
 	for _, v := range r.Details {
-		log.Infof("A new version is available: %s, details: %s", v.Version, v.Details)
+		log.Infof(context.TODO(), "A new version is available: %s, details: %s", v.Version, v.Details)
 	}
 }
 
 func (s *Server) usageReportingEnabled() bool {
 	// Grab the optin value from the database.
-	var ctx context.Context
+	ctx := context.TODO()
 	req := &serverpb.GetUIDataRequest{Keys: []string{optinKey}}
 	resp, err := s.admin.GetUIData(ctx, req)
 	if err != nil {
-		log.Warning(err)
+		log.Warning(ctx, err)
 		return false
 	}
 
@@ -215,7 +223,7 @@ func (s *Server) usageReportingEnabled() bool {
 	}
 	optin, err := strconv.ParseBool(string(val.Value))
 	if err != nil {
-		log.Warningf("could not parse optin value (%q): %v", val.Value, err)
+		log.Warningf(ctx, "could not parse optin value (%q): %v", val.Value, err)
 		return false
 	}
 	return optin
@@ -256,7 +264,7 @@ func (s *Server) getReportingInfo() reportingInfo {
 func (s *Server) reportUsage() {
 	b := new(bytes.Buffer)
 	if err := json.NewEncoder(b).Encode(s.getReportingInfo()); err != nil {
-		log.Warning(err)
+		log.Warning(context.TODO(), err)
 		return
 	}
 
@@ -265,10 +273,17 @@ func (s *Server) reportUsage() {
 	q.Set("uuid", s.node.ClusterID.String())
 	reportingURL.RawQuery = q.Encode()
 
-	_, err := http.Post(reportingURL.String(), "application/json", b)
+	res, err := http.Post(reportingURL.String(), "application/json", b)
 	if err != nil && log.V(2) {
 		// This is probably going to be relatively common in production
 		// environments where network access is usually curtailed.
-		log.Warning("Error checking reporting node usage metrics: ", err)
+		log.Warning(context.TODO(), "Failed to report node usage metrics: ", err)
+		return
+	}
+
+	if res.StatusCode != http.StatusOK {
+		b, err := ioutil.ReadAll(res.Body)
+		log.Warningf(context.TODO(), "Failed to report node usage metrics: status: %s, body: %s, "+
+			"error: %v", res.Status, b, err)
 	}
 }

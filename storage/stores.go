@@ -18,18 +18,18 @@ package storage
 
 import (
 	"fmt"
-	"sync"
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/protoutil"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/pkg/errors"
 )
 
@@ -42,7 +42,7 @@ import (
 // information to be read at node startup.
 type Stores struct {
 	clock      *hlc.Clock
-	mu         sync.RWMutex               // Protects storeMap and addrs
+	mu         syncutil.RWMutex           // Protects storeMap and addrs
 	storeMap   map[roachpb.StoreID]*Store // Map from StoreID to Store
 	biLatestTS hlc.Timestamp              // Timestamp of gossip bootstrap info
 	latestBI   *gossip.BootstrapInfo      // Latest cached bootstrap info
@@ -99,7 +99,7 @@ func (ls *Stores) AddStore(s *Store) {
 	// all stores have the most recent values.
 	if !ls.biLatestTS.Equal(hlc.ZeroTimestamp) {
 		if err := ls.updateBootstrapInfo(ls.latestBI); err != nil {
-			log.Errorf("failed to update bootstrap info on newly added store: %s", err)
+			log.Errorf(context.TODO(), "failed to update bootstrap info on newly added store: %s", err)
 		}
 	}
 }
@@ -111,13 +111,20 @@ func (ls *Stores) RemoveStore(s *Store) {
 	delete(ls.storeMap, s.Ident.StoreID)
 }
 
-// VisitStores implements a visitor pattern over stores in the storeMap.
-// The specified function is invoked with each store in turn. Stores are
-// visited in a random order.
+// VisitStores implements a visitor pattern over stores in the
+// storeMap. The specified function is invoked with each store in
+// turn. Care is taken to invoke the visitor func without the lock
+// held to avoid inconsistent lock orderings, as some visitor
+// functions may call back into the Stores object. Stores are visited
+// in random order.
 func (ls *Stores) VisitStores(visitor func(s *Store) error) error {
 	ls.mu.RLock()
-	defer ls.mu.RUnlock()
+	stores := make([]*Store, 0, len(ls.storeMap))
 	for _, s := range ls.storeMap {
+		stores = append(stores, s)
+	}
+	ls.mu.RUnlock()
+	for _, s := range stores {
 		if err := visitor(s); err != nil {
 			return err
 		}
@@ -137,16 +144,13 @@ func (ls *Stores) Send(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.B
 		if err != nil {
 			return nil, roachpb.NewError(err)
 		}
-		rangeID, repl, err := ls.lookupReplica(rs.Key, rs.EndKey)
+		rangeID, repDesc, err := ls.LookupReplica(rs.Key, rs.EndKey)
 		if err != nil {
 			return nil, roachpb.NewError(err)
 		}
 		ba.RangeID = rangeID
-		ba.Replica = *repl
+		ba.Replica = repDesc
 	}
-
-	ctx = log.Add(ctx,
-		log.RangeID, ba.RangeID)
 
 	store, err := ls.GetStore(ba.Replica.StoreID)
 	if err != nil {
@@ -182,55 +186,60 @@ func (ls *Stores) Send(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.B
 	return br, pErr
 }
 
-// lookupReplica looks up replica by key [range]. Lookups are done
-// by consulting each store in turn via Store.LookupRange(key).
+// LookupReplica looks up replica by key [range]. Lookups are done
+// by consulting each store in turn via Store.LookupReplica(key).
 // Returns RangeID and replica on success; RangeKeyMismatch error
 // if not found.
+// If end is nil, a replica containing start is looked up.
 // This is only for testing usage; performance doesn't matter.
-func (ls *Stores) lookupReplica(start, end roachpb.RKey) (rangeID roachpb.RangeID, replica *roachpb.ReplicaDescriptor, err error) {
+func (ls *Stores) LookupReplica(start, end roachpb.RKey) (rangeID roachpb.RangeID, repDesc roachpb.ReplicaDescriptor, err error) {
 	ls.mu.RLock()
 	defer ls.mu.RUnlock()
 	var rng *Replica
 	var partialDesc *roachpb.RangeDescriptor
+	var repDescFound bool
 	for _, store := range ls.storeMap {
 		rng = store.LookupReplica(start, end)
 		if rng == nil {
 			if tmpRng := store.LookupReplica(start, nil); tmpRng != nil {
-				log.Warningf("range not contained in one range: [%s,%s), but have [%s,%s)",
-					start, end, tmpRng.Desc().StartKey, tmpRng.Desc().EndKey)
 				partialDesc = tmpRng.Desc()
+				log.Warningf(context.TODO(), "range not contained in one range: [%s,%s), but have [%s,%s)",
+					start, end, partialDesc.StartKey, partialDesc.EndKey)
 				break
 			}
 			continue
 		}
-		if replica == nil {
+		if !repDescFound {
 			rangeID = rng.RangeID
-			replica, err = rng.GetReplica()
+			repDesc, err = rng.GetReplicaDescriptor()
 			if err != nil {
-				if _, ok := err.(*errReplicaNotInRange); !ok {
-					return 0, nil, err
+				if _, ok := err.(*roachpb.RangeNotFoundError); !ok {
+					return 0, roachpb.ReplicaDescriptor{}, err
 				}
+			} else {
+				repDescFound = true
 			}
 			continue
 		}
 		// Should never happen outside of tests.
-		return 0, nil, errors.Errorf(
-			"range %+v exists on additional store: %+v", rng, store)
+		return 0, roachpb.ReplicaDescriptor{}, errors.Errorf(
+			"range %+v exists on additional store: %+v", rng, store,
+		)
 	}
-	if replica == nil {
+	if !repDescFound {
 		err = roachpb.NewRangeKeyMismatchError(start.AsRawKey(), end.AsRawKey(), partialDesc)
 	}
-	return rangeID, replica, err
+	return rangeID, repDesc, err
 }
 
 // FirstRange implements the RangeDescriptorDB interface. It returns the
 // range descriptor which contains KeyMin.
 func (ls *Stores) FirstRange() (*roachpb.RangeDescriptor, error) {
-	_, replica, err := ls.lookupReplica(roachpb.RKeyMin, nil)
+	_, repDesc, err := ls.LookupReplica(roachpb.RKeyMin, nil)
 	if err != nil {
 		return nil, err
 	}
-	store, err := ls.GetStore(replica.StoreID)
+	store, err := ls.GetStore(repDesc.StoreID)
 	if err != nil {
 		return nil, err
 	}
@@ -242,8 +251,9 @@ func (ls *Stores) FirstRange() (*roachpb.RangeDescriptor, error) {
 	return rpl.Desc(), nil
 }
 
-// RangeLookup implements the RangeDescriptorDB interface. It looks up
-// the descriptors for the given (meta) key.
+// RangeLookup implements the RangeDescriptorDB interface.
+// This implementation of RangeDescriptorDB seems to only be used by
+// LocalTestCluster.
 func (ls *Stores) RangeLookup(
 	key roachpb.RKey, _ *roachpb.RangeDescriptor, considerIntents, useReverseScan bool,
 ) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, *roachpb.Error) {
@@ -289,7 +299,7 @@ func (ls *Stores) ReadBootstrapInfo(bi *gossip.BootstrapInfo) error {
 			*bi = storeBI
 		}
 	}
-	log.Infof("read %d node addresses from persistent storage", len(bi.Addresses))
+	log.Infof(context.TODO(), "read %d node addresses from persistent storage", len(bi.Addresses))
 	return ls.updateBootstrapInfo(bi)
 }
 
@@ -304,7 +314,7 @@ func (ls *Stores) WriteBootstrapInfo(bi *gossip.BootstrapInfo) error {
 	if err := ls.updateBootstrapInfo(bi); err != nil {
 		return err
 	}
-	log.Infof("wrote %d node addresses to persistent storage", len(bi.Addresses))
+	log.Infof(context.TODO(), "wrote %d node addresses to persistent storage", len(bi.Addresses))
 	return nil
 }
 

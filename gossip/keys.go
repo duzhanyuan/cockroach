@@ -42,6 +42,11 @@ const (
 	// The suffix is a store ID and the value is roachpb.StoreDescriptor.
 	KeyStorePrefix = "store"
 
+	// KeyDeadReplicasPrefix is the key prefix for gossiping dead replicas in the
+	// network. The suffix is a store ID and the value is
+	// roachpb.StoreDeadReplicas.
+	KeyDeadReplicasPrefix = "replica-dead"
+
 	// KeyNodeIDPrefix is the key prefix for gossiping node id
 	// addresses. The actual key is suffixed with the decimal
 	// representation of the node id and the value is the host:port
@@ -51,7 +56,7 @@ const (
 	// KeySentinel is a key for gossip which must not expire or
 	// else the node considers itself partitioned and will retry with
 	// bootstrap hosts.  The sentinel is gossiped by the node that holds
-	// the leader lease for the first range.
+	// the range lease for the first range.
 	KeySentinel = "sentinel"
 
 	// KeyFirstRangeDescriptor is the descriptor for the "first"
@@ -89,4 +94,9 @@ func MakeNodeIDKey(nodeID roachpb.NodeID) string {
 // MakeStoreKey returns the gossip key for the given store.
 func MakeStoreKey(storeID roachpb.StoreID) string {
 	return MakeKey(KeyStorePrefix, storeID.String())
+}
+
+// MakeDeadReplicasKey returns the dead replicas gossip key for the given store.
+func MakeDeadReplicasKey(storeID roachpb.StoreID) string {
+	return MakeKey(KeyDeadReplicasPrefix, storeID.String())
 }

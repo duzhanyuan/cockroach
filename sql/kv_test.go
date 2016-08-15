@@ -24,12 +24,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/security"
-	"github.com/cockroachdb/cockroach/server"
-	"github.com/cockroachdb/cockroach/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	"github.com/pkg/errors"
 )
@@ -54,7 +55,7 @@ type kvNative struct {
 
 func newKVNative(b *testing.B) kvInterface {
 	enableTracing := tracing.Disable()
-	s := server.StartTestServer(b)
+	s, _, _ := serverutils.StartServer(b, base.TestServerArgs{})
 
 	// TestServer.DB() returns the TxnCoordSender wrapped client. But that isn't
 	// a fair comparison with SQL as we want these client requests to be sent
@@ -74,7 +75,7 @@ func newKVNative(b *testing.B) kvInterface {
 	return &kvNative{
 		db: client.NewDB(sender),
 		doneFn: func() {
-			s.Stop()
+			s.Stopper().Stop()
 			enableTracing()
 		},
 	}
@@ -83,7 +84,7 @@ func newKVNative(b *testing.B) kvInterface {
 func (kv *kvNative) insert(rows, run int) error {
 	firstRow := rows * run
 	lastRow := rows * (run + 1)
-	err := kv.db.Txn(func(txn *client.Txn) error {
+	err := kv.db.Txn(context.TODO(), func(txn *client.Txn) error {
 		b := txn.NewBatch()
 		for i := firstRow; i < lastRow; i++ {
 			b.Put(fmt.Sprintf("%s%06d", kv.prefix, i), i)
@@ -95,7 +96,7 @@ func (kv *kvNative) insert(rows, run int) error {
 
 func (kv *kvNative) update(rows, run int) error {
 	perm := rand.Perm(rows)
-	err := kv.db.Txn(func(txn *client.Txn) error {
+	err := kv.db.Txn(context.TODO(), func(txn *client.Txn) error {
 		// Read all values in a batch.
 		b := txn.NewBatch()
 		for i := 0; i < rows; i++ {
@@ -110,10 +111,7 @@ func (kv *kvNative) update(rows, run int) error {
 			v := result.Rows[0].ValueInt()
 			wb.Put(fmt.Sprintf("%s%06d", kv.prefix, perm[i]), v+1)
 		}
-		if err := txn.CommitInBatch(wb); err != nil {
-			return err
-		}
-		return nil
+		return txn.CommitInBatch(wb)
 	})
 	return err
 }
@@ -121,7 +119,7 @@ func (kv *kvNative) update(rows, run int) error {
 func (kv *kvNative) del(rows, run int) error {
 	firstRow := rows * run
 	lastRow := rows * (run + 1)
-	err := kv.db.Txn(func(txn *client.Txn) error {
+	err := kv.db.Txn(context.TODO(), func(txn *client.Txn) error {
 		b := txn.NewBatch()
 		for i := firstRow; i < lastRow; i++ {
 			b.Del(fmt.Sprintf("%s%06d", kv.prefix, i))
@@ -133,7 +131,7 @@ func (kv *kvNative) del(rows, run int) error {
 
 func (kv *kvNative) scan(rows, run int) error {
 	var kvs []client.KeyValue
-	err := kv.db.Txn(func(txn *client.Txn) error {
+	err := kv.db.Txn(context.TODO(), func(txn *client.Txn) error {
 		var err error
 		kvs, err = txn.Scan(fmt.Sprintf("%s%06d", kv.prefix, 0), fmt.Sprintf("%s%06d", kv.prefix, rows), int64(rows))
 		return err
@@ -150,7 +148,7 @@ func (kv *kvNative) prep(rows int, initData bool) error {
 	if !initData {
 		return nil
 	}
-	err := kv.db.Txn(func(txn *client.Txn) error {
+	err := kv.db.Txn(context.TODO(), func(txn *client.Txn) error {
 		b := txn.NewBatch()
 		for i := 0; i < rows; i++ {
 			b.Put(fmt.Sprintf("%s%06d", kv.prefix, i), i)
@@ -172,13 +170,9 @@ type kvSQL struct {
 
 func newKVSQL(b *testing.B) kvInterface {
 	enableTracing := tracing.Disable()
-	s := server.StartTestServer(b)
-	pgURL, cleanupURL := sqlutils.PGUrl(b, s.ServingAddr(), security.RootUser, "benchmarkCockroach")
-	pgURL.Path = "bench"
-	db, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		b.Fatal(err)
-	}
+	s, db, _ := serverutils.StartServer(
+		b, base.TestServerArgs{UseDatabase: "bench"})
+
 	if _, err := db.Exec(`CREATE DATABASE IF NOT EXISTS bench`); err != nil {
 		b.Fatal(err)
 	}
@@ -186,9 +180,7 @@ func newKVSQL(b *testing.B) kvInterface {
 	kv := &kvSQL{}
 	kv.db = db
 	kv.doneFn = func() {
-		db.Close()
-		cleanupURL()
-		s.Stop()
+		s.Stopper().Stop()
 		enableTracing()
 	}
 	return kv

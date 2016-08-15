@@ -19,6 +19,7 @@ package gossip
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -29,15 +30,19 @@ import (
 	"github.com/cockroachdb/cockroach/util/grpcutil"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // client is a client-side RPC connection to a gossip peer node.
 type client struct {
+	createdAt             time.Time
 	peerID                roachpb.NodeID           // Peer node ID; 0 until first gossip response
 	addr                  net.Addr                 // Peer node network address
 	forwardAddr           *util.UnresolvedAddr     // Set if disconnected with an alternate addr
 	remoteHighWaterStamps map[roachpb.NodeID]int64 // Remote server's high water timestamps
 	closer                chan struct{}            // Client shutdown channel
+	clientMetrics         metrics
+	nodeMetrics           metrics
 }
 
 // extractKeys returns a string representation of a gossip delta's keys.
@@ -50,18 +55,25 @@ func extractKeys(delta map[string]*Info) string {
 }
 
 // newClient creates and returns a client struct.
-func newClient(addr net.Addr) *client {
+func newClient(addr net.Addr, nodeMetrics metrics) *client {
 	return &client{
-		addr: addr,
+		createdAt: timeutil.Now(),
+		addr:      addr,
 		remoteHighWaterStamps: map[roachpb.NodeID]int64{},
 		closer:                make(chan struct{}),
+		clientMetrics:         makeMetrics(),
+		nodeMetrics:           nodeMetrics,
 	}
 }
 
 // start dials the remote addr and commences gossip once connected. Upon exit,
 // the client is sent on the disconnected channel. This method starts client
 // processing in a goroutine and returns immediately.
-func (c *client) start(g *Gossip, disconnected chan *client, ctx *rpc.Context, stopper *stop.Stopper) {
+func (c *client) start(g *Gossip, disconnected chan *client, rpcCtx *rpc.Context, stopper *stop.Stopper) {
+	ctx := context.TODO()
+	nodeID := g.is.NodeID
+	log.Infof(ctx, "node %d: starting client to %s", nodeID, c.addr)
+
 	stopper.RunWorker(func() {
 		defer func() {
 			disconnected <- c
@@ -71,22 +83,22 @@ func (c *client) start(g *Gossip, disconnected chan *client, ctx *rpc.Context, s
 		// asynchronous from the caller's perspective, so the only effect of
 		// `WithBlock` here is blocking shutdown - at the time of this writing,
 		// that ends ups up making `kv` tests take twice as long.
-		conn, err := ctx.GRPCDial(c.addr.String())
+		conn, err := rpcCtx.GRPCDial(c.addr.String())
 		if err != nil {
-			log.Errorf("failed to dial: %v", err)
+			log.Errorf(ctx, "node %d: failed to dial: %s", nodeID, err)
 			return
 		}
 
 		// Start gossiping.
-		if err := c.gossip(g, NewGossipClient(conn), stopper); err != nil {
+		if err := c.gossip(ctx, g, NewGossipClient(conn), stopper); err != nil {
 			if !grpcutil.IsClosedConnection(err) {
 				g.mu.Lock()
 				peerID := c.peerID
 				g.mu.Unlock()
 				if peerID != 0 {
-					log.Infof("closing client to node %d (%s): %s", peerID, c.addr, err)
+					log.Infof(ctx, "node %d: closing client to node %d (%s): %s", nodeID, peerID, c.addr, err)
 				} else {
-					log.Infof("closing client to %s: %s", c.addr, err)
+					log.Infof(ctx, "node %d: closing client to %s: %s", nodeID, c.addr, err)
 				}
 			}
 		}
@@ -114,6 +126,10 @@ func (c *client) requestGossip(g *Gossip, addr util.UnresolvedAddr, stream Gossi
 	}
 	g.mu.Unlock()
 
+	bytesSent := int64(args.Size())
+	c.clientMetrics.BytesSent.Add(bytesSent)
+	c.nodeMetrics.BytesSent.Add(bytesSent)
+
 	return stream.Send(args)
 }
 
@@ -129,6 +145,17 @@ func (c *client) sendGossip(g *Gossip, addr util.UnresolvedAddr, stream Gossip_G
 			HighWaterStamps: g.is.getHighWaterStamps(),
 		}
 
+		bytesSent := int64(args.Size())
+		infosSent := int64(len(delta))
+		c.clientMetrics.BytesSent.Add(bytesSent)
+		c.clientMetrics.InfosSent.Add(infosSent)
+		c.nodeMetrics.BytesSent.Add(bytesSent)
+		c.nodeMetrics.InfosSent.Add(infosSent)
+
+		if log.V(1) {
+			log.Infof(context.TODO(), "node %d: sending %s", g.is.NodeID, extractKeys(args.Delta))
+		}
+
 		g.mu.Unlock()
 		return stream.Send(&args)
 	}
@@ -142,15 +169,22 @@ func (c *client) handleResponse(g *Gossip, reply *Response) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	bytesReceived := int64(reply.Size())
+	infosReceived := int64(len(reply.Delta))
+	c.clientMetrics.BytesReceived.Add(bytesReceived)
+	c.clientMetrics.InfosReceived.Add(infosReceived)
+	c.nodeMetrics.BytesReceived.Add(bytesReceived)
+	c.nodeMetrics.InfosReceived.Add(infosReceived)
+
 	// Combine remote node's infostore delta with ours.
 	if reply.Delta != nil {
 		freshCount, err := g.is.combine(reply.Delta, reply.NodeID)
 		if err != nil {
-			log.Warningf("node %d failed to fully combine delta from node %d: %s", g.is.NodeID, reply.NodeID, err)
+			log.Warningf(context.TODO(), "node %d: failed to fully combine delta from node %d: %s", g.is.NodeID, reply.NodeID, err)
 		}
 		if infoCount := len(reply.Delta); infoCount > 0 {
 			if log.V(1) {
-				log.Infof("node %d received %s from node %d (%d fresh)", g.is.NodeID, extractKeys(reply.Delta), reply.NodeID, freshCount)
+				log.Infof(context.TODO(), "node %d: received %s from node %d (%d fresh)", g.is.NodeID, extractKeys(reply.Delta), reply.NodeID, freshCount)
 			}
 		}
 		g.maybeTighten()
@@ -195,14 +229,14 @@ func (c *client) handleResponse(g *Gossip, reply *Response) error {
 // gossip loops, sending deltas of the infostore and receiving deltas
 // in turn. If an alternate is proposed on response, the client addr
 // is modified and method returns for forwarding by caller.
-func (c *client) gossip(g *Gossip, gossipClient GossipClient, stopper *stop.Stopper) error {
+func (c *client) gossip(ctx context.Context, g *Gossip, gossipClient GossipClient, stopper *stop.Stopper) error {
 	// For un-bootstrapped node, g.is.NodeID is 0 when client start gossip,
 	// so it's better to get nodeID from g.is every time.
 	g.mu.Lock()
 	addr := g.is.NodeAddr
 	g.mu.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := gossipClient.Gossip(ctx)
 	if err != nil {

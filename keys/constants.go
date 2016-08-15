@@ -100,8 +100,8 @@ var (
 	LocalRaftTombstoneSuffix = []byte("rftb")
 	// localRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
 	LocalRaftTruncatedStateSuffix = []byte("rftt")
-	// localRangeLeaderLeaseSuffix is the suffix for a range leader lease.
-	LocalRangeLeaderLeaseSuffix = []byte("rll-")
+	// localRangeLeaseSuffix is the suffix for a range lease.
+	LocalRangeLeaseSuffix = []byte("rll-")
 	// LocalLeaseAppliedIndexSuffix is the suffix for the applied lease index.
 	LocalLeaseAppliedIndexSuffix = []byte("rlla")
 	// localRangeStatsSuffix is the suffix for range statistics.
@@ -125,6 +125,9 @@ var (
 	// localRangeLastVerificationTimestampSuffix is the suffix for a range's
 	// last verification timestamp (for checking integrity of on-disk data).
 	LocalRangeLastVerificationTimestampSuffix = []byte("rlvt")
+	// LocalRangeReplicaDestroyedErrorSuffix is the suffix for a range's replica
+	// destroyed error (for marking replicas as dead).
+	LocalRangeReplicaDestroyedErrorSuffix = []byte("rrde")
 
 	// LocalRangePrefix is the prefix identifying per-range data indexed
 	// by range key (either start key, or some key in the range). The
@@ -140,9 +143,6 @@ var (
 	// LocalRangeDescriptorSuffix is the suffix for keys storing
 	// range descriptors. The value is a struct of type RangeDescriptor.
 	LocalRangeDescriptorSuffix = roachpb.RKey("rdsc")
-	// localRangeTreeNodeSuffix is the suffix for keys storing
-	// range tree nodes.  The value is a struct of type RangeTreeNode.
-	localRangeTreeNodeSuffix = roachpb.RKey("rtn-")
 	// localTransactionSuffix specifies the key suffix for
 	// transaction records. The additional detail is the transaction id.
 	// NOTE: if this value changes, it must be updated in C++
@@ -182,8 +182,6 @@ var (
 	RangeIDGenerator = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("range-idgen")))
 	// StoreIDGenerator is the global store ID generator sequence.
 	StoreIDGenerator = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("store-idgen")))
-	// RangeTreeRoot specifies the root range in the range tree.
-	RangeTreeRoot = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("range-tree-root")))
 
 	// StatusPrefix specifies the key prefix to store all status details.
 	StatusPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("status-")))
@@ -226,6 +224,9 @@ const (
 	// IDs. Reserved IDs are used by namespaces and tables used internally by
 	// cockroach.
 	MaxReservedDescID = 49
+
+	// VirtualDescriptorID is the ID used by all virtual descriptors.
+	VirtualDescriptorID = math.MaxUint32
 
 	// RootNamespaceID is the ID of the root namespace.
 	RootNamespaceID = 0

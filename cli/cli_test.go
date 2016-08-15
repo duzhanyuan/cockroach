@@ -31,19 +31,23 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/build"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/security/securitytest"
 	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 type cliTest struct {
-	server.TestServer
+	*server.TestServer
 	certsDir    string
 	cleanupFunc func()
 }
@@ -51,7 +55,7 @@ type cliTest struct {
 func (c cliTest) stop() {
 	c.cleanupFunc()
 	security.SetReadFileFn(securitytest.Asset)
-	c.Stop()
+	c.Stopper().Stop()
 }
 
 func newCLITest() cliTest {
@@ -63,14 +67,14 @@ func newCLITest() cliTest {
 
 	osStderr = os.Stdout
 
-	var s server.TestServer
-	if err := s.Start(); err != nil {
-		log.Fatalf("Could not start server: %v", err)
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
+	if err != nil {
+		log.Fatalf(context.Background(), "Could not start server: %v", err)
 	}
 
 	tempDir, err := ioutil.TempDir("", "cli-test")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(context.Background(), err)
 	}
 
 	// Copy these assets to disk from embedded strings, so this test can
@@ -93,11 +97,11 @@ func newCLITest() cliTest {
 	}
 
 	return cliTest{
-		TestServer: s,
+		TestServer: s.(*server.TestServer),
 		certsDir:   tempDir,
 		cleanupFunc: func() {
 			if err := os.RemoveAll(tempDir); err != nil {
-				log.Fatal(err)
+				log.Fatal(context.Background(), err)
 			}
 		},
 	}
@@ -113,6 +117,14 @@ func (c cliTest) Run(line string) {
 // errors in executing c, because those will be caught when the test verifies
 // the output of c.
 func (c cliTest) RunWithCapture(line string) (out string, err error) {
+	return captureOutput(func() {
+		c.Run(line)
+	})
+}
+
+// captureOutput runs f and returns a string containing the output and any
+// error that may have occurred capturing the output.
+func captureOutput(f func()) (out string, err error) {
 	// Heavily inspired by Go's testing/example.go:runExample().
 
 	// Funnel stdout into a pipe.
@@ -149,7 +161,7 @@ func (c cliTest) RunWithCapture(line string) (out string, err error) {
 	}()
 
 	// Run the command. The output will be returned in the defer block.
-	c.Run(line)
+	f()
 	return
 }
 
@@ -289,14 +301,13 @@ func Example_quoted() {
 }
 
 func Example_insecure() {
-	c := cliTest{cleanupFunc: func() {}}
-	ctx := server.MakeTestContext()
-	ctx.Insecure = true
-	c.TestServer.Ctx = &ctx
-	if err := c.Start(); err != nil {
-		log.Fatalf("Could not start server: %v", err)
+	s, err := serverutils.StartServerRaw(
+		base.TestServerArgs{Insecure: true})
+	if err != nil {
+		log.Fatalf(context.Background(), "Could not start server: %v", err)
 	}
-	defer c.stop()
+	defer s.Stopper().Stop()
+	c := cliTest{TestServer: s.(*server.TestServer), cleanupFunc: func() {}}
 
 	c.Run("debug kv put --insecure a 1 b 2")
 	c.Run("debug kv scan --insecure")
@@ -474,29 +485,23 @@ func Example_zone() {
 	c := newCLITest()
 	defer c.stop()
 
-	const zone1 = `replicas:
-- attrs: [us-east-1a,ssd]`
-	const zone2 = `range_max_bytes: 134217728`
-
 	c.Run("zone ls")
-	// Call RunWithArgs to bypass the "split-by-whitespace" arg builder.
-	c.RunWithArgs([]string{"zone", "set", "system", zone1})
+	c.Run("zone set system --file=./testdata/zone_attrs.yaml")
 	c.Run("zone ls")
 	c.Run("zone get system.nonexistent")
 	c.Run("zone get system.lease")
-	c.RunWithArgs([]string{"zone", "set", "system", zone2})
+	c.Run("zone set system --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 	c.Run("zone rm system")
 	c.Run("zone ls")
 	c.Run("zone rm .default")
-	c.RunWithArgs([]string{"zone", "set", ".default", zone2})
+	c.Run("zone set .default --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 
 	// Output:
 	// zone ls
 	// .default
-	// zone set system replicas:
-	// - attrs: [us-east-1a,ssd]
+	// zone set system --file=./testdata/zone_attrs.yaml
 	// INSERT 1
 	// replicas:
 	// - attrs: [us-east-1a, ssd]
@@ -517,7 +522,7 @@ func Example_zone() {
 	// range_max_bytes: 67108864
 	// gc:
 	//   ttlseconds: 86400
-	// zone set system range_max_bytes: 134217728
+	// zone set system --file=./testdata/zone_range_max_bytes.yaml
 	// UPDATE 1
 	// replicas:
 	// - attrs: [us-east-1a, ssd]
@@ -539,7 +544,7 @@ func Example_zone() {
 	// .default
 	// zone rm .default
 	// unable to remove .default
-	// zone set .default range_max_bytes: 134217728
+	// zone set .default --file=./testdata/zone_range_max_bytes.yaml
 	// UPDATE 1
 	// replicas:
 	// - attrs: []
@@ -590,8 +595,9 @@ func Example_sql() {
 	// x	y
 	// 42	69
 	// sql --execute=show databases
-	// 2 rows
+	// 3 rows
 	// Database
+	// information_schema
 	// system
 	// t
 	// sql -e explain select 3
@@ -828,6 +834,7 @@ Available Commands:
   user           get, set, list and remove users
   zone           get, set, list and remove zones
   node           list nodes and show their status
+  dump           dump sql tables
 
   gen            generate manpages and bash completion file
   version        output version information
@@ -835,6 +842,7 @@ Available Commands:
 
 Flags:
       --alsologtostderr value[=INFO]   logs at or above this threshold go to stderr (default NONE)
+      --duration-random value          duration for randomized dump test to run (default 1s)
       --log-backtrace-at value         when logging hits line file:N, emit a stack trace (default :0)
       --log-dir value                  if non-empty, write log files in this directory
       --logtostderr                    log to standard error instead of files
@@ -856,7 +864,7 @@ func Example_node() {
 
 	// Refresh time series data, which is required to retrieve stats.
 	if err := c.TestServer.WriteSummaries(); err != nil {
-		log.Fatalf("Couldn't write stats summaries: %s", err)
+		log.Fatalf(context.Background(), "Couldn't write stats summaries: %s", err)
 	}
 
 	c.Run("node ls")
@@ -1122,11 +1130,11 @@ func TestGenAutocomplete(t *testing.T) {
 	if err := Run([]string{"gen", "autocomplete", "--out=" + acpath}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := os.Stat(acpath)
+	info, err := os.Stat(acpath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Size() < minsize {
-		t.Fatalf("autocomplete file size (%d) < minimum (%d)", s.Size(), minsize)
+	if size := info.Size(); size < minsize {
+		t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
 	}
 }

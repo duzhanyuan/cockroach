@@ -43,7 +43,7 @@ SELECT * FROM kv WHERE (k,v) IN (SELECT * FROM kv)
 5 6
 7 8
 
-query error qualified name "nonexistent" not found
+query error column name "nonexistent" not found
 SELECT * FROM kv WHERE nonexistent = 1
 
 query B
@@ -54,6 +54,12 @@ false
 
 query B
 SELECT 'hello' SIMILAR TO v FROM kvString WHERE k SIMILAR TO 'like[1-2]'
+----
+true
+false
+
+query B
+SELECT 'hello' ~ replace(v, '%', '.*') FROM kvString WHERE k ~ 'like[1-2]'
 ----
 true
 false

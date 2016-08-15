@@ -21,10 +21,12 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/leaktest"
@@ -33,8 +35,8 @@ import (
 func TestTableReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	_, sqlDB, kvDB, cleanup := sqlutils.SetupServer(t)
-	defer cleanup()
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	// Create a table where each row is:
 	//
@@ -61,7 +63,7 @@ func TestTableReader(t *testing.T) {
 
 	makeIndexSpan := func(start, end int) TableReaderSpan {
 		var span roachpb.Span
-		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(td.ID, td.Indexes[0].ID))
+		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(td, td.Indexes[0].ID))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -105,9 +107,14 @@ func TestTableReader(t *testing.T) {
 		ts.Table = *td
 
 		txn := client.NewTxn(context.Background(), *kvDB)
+		flowCtx := FlowCtx{
+			Context: context.Background(),
+			evalCtx: &parser.EvalContext{},
+			txn:     txn,
+		}
 
 		out := &RowBuffer{}
-		tr, err := newTableReader(&ts, txn, out, &parser.EvalContext{})
+		tr, err := newTableReader(&flowCtx, &ts, out)
 		if err != nil {
 			t.Fatal(err)
 		}

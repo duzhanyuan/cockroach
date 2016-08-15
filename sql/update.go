@@ -39,8 +39,8 @@ type editNodeBase struct {
 	autoCommit bool
 }
 
-func (p *planner) makeEditNode(t parser.TableExpr, autoCommit bool, priv privilege.Kind) (editNodeBase, error) {
-	tableDesc, err := p.getAliasedTableLease(t)
+func (p *planner) makeEditNode(tn *parser.TableName, autoCommit bool, priv privilege.Kind) (editNodeBase, error) {
+	tableDesc, err := p.getTableLease(tn)
 	if err != nil {
 		return editNodeBase{}, err
 	}
@@ -62,6 +62,8 @@ type editNodeRun struct {
 	rows      planNode
 	tw        tableWriter
 	resultRow parser.DTuple
+
+	explain explainMode
 }
 
 func (r *editNodeRun) initEditNode(en *editNodeBase, rows planNode, re parser.ReturningExprs, desiredTypes []parser.Datum) error {
@@ -125,7 +127,12 @@ type updateNode struct {
 func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoCommit bool) (planNode, error) {
 	tracing.AnnotateTrace()
 
-	en, err := p.makeEditNode(n.Table, autoCommit, privilege.UPDATE)
+	tn, err := p.getAliasedTableName(n.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	en, err := p.makeEditNode(tn, autoCommit, privilege.UPDATE)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +170,7 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 		requestedCols = en.tableDesc.Columns
 	}
 
-	fkTables := TablesNeededForFKs(*en.tableDesc, CheckUpdates)
+	fkTables := tablesNeededForFKs(*en.tableDesc, CheckUpdates)
 	if err := p.fillFKTableMap(fkTables); err != nil {
 		return nil, err
 	}
@@ -211,7 +218,7 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 
 	rows, err := p.SelectClause(&parser.SelectClause{
 		Exprs: targets,
-		From:  []parser.TableExpr{n.Table},
+		From:  &parser.From{Tables: []parser.TableExpr{n.Table}},
 		Where: n.Where,
 	}, nil, nil, desiredTypesFromSelect, publicAndNonPublicColumns)
 	if err != nil {
@@ -252,7 +259,7 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 		updateColsIdx: updateColsIdx,
 		tw:            tw,
 	}
-	if err := un.checkHelper.init(p, en.tableDesc); err != nil {
+	if err := un.checkHelper.init(p, tn, en.tableDesc); err != nil {
 		return nil, err
 	}
 	if err := un.run.initEditNode(&un.editNodeBase, rows, n.Returning, desiredTypes); err != nil {
@@ -282,9 +289,13 @@ func (u *updateNode) Next() (bool, error) {
 	if !next {
 		if err == nil {
 			// We're done. Finish the batch.
-			err = u.tw.finalize()
+			err = u.tw.finalize(u.p.ctx())
 		}
 		return false, err
+	}
+
+	if u.run.explain == explainDebug {
+		return true, nil
 	}
 
 	tracing.AnnotateTrace()
@@ -317,7 +328,7 @@ func (u *updateNode) Next() (bool, error) {
 		}
 	}
 
-	newValues, err := u.tw.row(append(oldValues, updateValues...))
+	newValues, err := u.tw.row(u.p.ctx(), append(oldValues, updateValues...))
 	if err != nil {
 		return false, err
 	}
@@ -332,8 +343,8 @@ func (u *updateNode) Next() (bool, error) {
 }
 
 // namesForExprs expands names in the tuples and subqueries in exprs.
-func (p *planner) namesForExprs(exprs parser.UpdateExprs) (parser.QualifiedNames, error) {
-	var names parser.QualifiedNames
+func (p *planner) namesForExprs(exprs parser.UpdateExprs) (parser.UnresolvedNames, error) {
+	var names parser.UnresolvedNames
 	for _, expr := range exprs {
 		newExpr := expr.Expr
 
@@ -379,6 +390,10 @@ func (u *updateNode) Values() parser.DTuple {
 }
 
 func (u *updateNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	u.run.explain = mode
 	u.run.rows.MarkDebug(mode)
 }
 

@@ -248,6 +248,19 @@ func (expr *CastExpr) TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, err
 }
 
 // TypeCheck implements the Expr interface.
+func (expr *AnnotateTypeExpr) TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, error) {
+	annotType := expr.annotationType()
+	subExpr, err := typeCheckAndRequire(ctx, expr.Expr, annotType,
+		fmt.Sprintf("type assertion for %v as %s, found", expr.Expr, annotType.Type()))
+	if err != nil {
+		return nil, err
+	}
+	expr.Expr = subExpr
+	expr.typ = subExpr.ReturnType()
+	return expr, nil
+}
+
+// TypeCheck implements the Expr interface.
 func (expr *CoalesceExpr) TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, error) {
 	typedSubExprs, retType, err := typeCheckSameTypedExprs(ctx, desired, expr.Exprs...)
 	if err != nil {
@@ -286,12 +299,17 @@ func (expr *ExistsExpr) TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, e
 
 // TypeCheck implements the Expr interface.
 func (expr *FuncExpr) TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, error) {
-	if len(expr.Name.Indirect) > 0 {
-		// We don't support qualified function names (yet).
-		return nil, fmt.Errorf("unknown function: %s", expr.Name)
+	fname, err := expr.Name.Normalize()
+	if err != nil {
+		return nil, err
 	}
 
-	name := string(expr.Name.Base)
+	if len(fname.Context) > 0 {
+		// We don't support qualified function names (yet).
+		return nil, fmt.Errorf("unknown function: %s", fname)
+	}
+
+	name := string(fname.FunctionName)
 	// Optimize for the case where name is already normalized to upper/lower
 	// case. Note that the Builtins map contains duplicate entries for
 	// upper/lower case names.
@@ -423,24 +441,46 @@ func (expr *ParenExpr) TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, er
 	return expr, nil
 }
 
-// qualifiedNameTypes is a mapping of qualified names to types that can be mocked out
+// presetTypesForTesting is a mapping of qualified names to types that can be mocked out
 // for tests to allow the qualified names to be type checked without throwing an error.
-var qualifiedNameTypes map[string]Datum
+var presetTypesForTesting map[string]Datum
 
-func mockQualifiedNameTypes(types map[string]Datum) func() {
-	qualifiedNameTypes = types
+func mockNameTypes(types map[string]Datum) func() {
+	presetTypesForTesting = types
 	return func() {
-		qualifiedNameTypes = nil
+		presetTypesForTesting = nil
 	}
 }
 
-// TypeCheck implements the Expr interface.
-func (expr *QualifiedName) TypeCheck(_ *SemaContext, desired Datum) (TypedExpr, error) {
+// TypeCheck implements the Expr interface.  This function has a valid
+// implementation only for testing within this package. During query
+// execution, ColumnItems are replaced to qvalues prior to type
+// checking.
+func (expr *ColumnItem) TypeCheck(_ *SemaContext, desired Datum) (TypedExpr, error) {
 	name := expr.String()
-	if _, ok := qualifiedNameTypes[name]; ok {
+	if _, ok := presetTypesForTesting[name]; ok {
 		return expr, nil
 	}
-	return nil, fmt.Errorf("qualified name \"%s\" not found", name)
+	return nil, fmt.Errorf("name \"%s\" is not defined", name)
+}
+
+// TypeCheck implements the Expr interface.
+func (expr UnqualifiedStar) TypeCheck(_ *SemaContext, desired Datum) (TypedExpr, error) {
+	return nil, errors.New("cannot use \"*\" in this context")
+}
+
+// TypeCheck implements the Expr interface.
+func (expr UnresolvedName) TypeCheck(s *SemaContext, desired Datum) (TypedExpr, error) {
+	v, err := expr.NormalizeVarName()
+	if err != nil {
+		return nil, err
+	}
+	return v.TypeCheck(s, desired)
+}
+
+// TypeCheck implements the Expr interface.
+func (expr *AllColumnsSelector) TypeCheck(_ *SemaContext, desired Datum) (TypedExpr, error) {
+	return nil, fmt.Errorf("cannot use %q in this context", expr)
 }
 
 // TypeCheck implements the Expr interface.
@@ -457,7 +497,7 @@ func (expr *RangeCond) TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, er
 
 // TypeCheck implements the Expr interface.
 func (expr *Subquery) TypeCheck(_ *SemaContext, desired Datum) (TypedExpr, error) {
-	panic("Subquery nodes must be replaced before type checking")
+	panic("subquery nodes must be replaced before type checking")
 }
 
 // TypeCheck implements the Expr interface.
@@ -687,11 +727,11 @@ func typeCheckComparisonOp(
 	}
 
 	leftExpr, rightExpr := typedSubExprs[0], typedSubExprs[1]
-	leftReturn := leftExpr.(TypedExpr).ReturnType()
-	rightReturn := rightExpr.(TypedExpr).ReturnType()
 	if switched {
 		leftExpr, rightExpr = rightExpr, leftExpr
 	}
+	leftReturn := leftExpr.(TypedExpr).ReturnType()
+	rightReturn := rightExpr.(TypedExpr).ReturnType()
 	if leftReturn == DNull || rightReturn == DNull {
 		switch op {
 		case Is, IsNot, IsDistinctFrom, IsNotDistinctFrom:
@@ -973,33 +1013,61 @@ type placeholderAnnotationVisitor struct {
 	placeholders map[string]annotationState
 }
 
+// annotationState holds the state of an unreseolved type annotation for a given placeholder.
 type annotationState struct {
-	every bool
-	typ   Datum
+	sawAssertion   bool // marks if the placeholder has been subject to at least one type assetion
+	shouldAnnotate bool // marks if the placeholder should be annotated with the type typ
+	typ            Datum
 }
 
 func (v *placeholderAnnotationVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	switch t := expr.(type) {
-	// TODO(nvanbenschoten) Add support for explicit type annotations.
-	// case *TypeAnnotationExpr:
+	case *AnnotateTypeExpr:
+		if arg, ok := t.Expr.(Placeholder); ok {
+			assertType := t.annotationType()
+			if state, ok := v.placeholders[arg.Name]; ok && state.sawAssertion {
+				if state.shouldAnnotate && !assertType.TypeEqual(state.typ) {
+					state.shouldAnnotate = false
+					v.placeholders[arg.Name] = state
+				}
+			} else {
+				// Ignore any previous casts now that we see an annotation.
+				v.placeholders[arg.Name] = annotationState{
+					sawAssertion:   true,
+					shouldAnnotate: true,
+					typ:            assertType,
+				}
+			}
+			return false, expr
+		}
 	case *CastExpr:
 		if arg, ok := t.Expr.(Placeholder); ok {
 			castType, _ := t.castTypeAndValidArgTypes()
 			if state, ok := v.placeholders[arg.Name]; ok {
-				if state.every && !castType.TypeEqual(state.typ) {
-					state.every = false
+				// Ignore casts once an assertion has been seen.
+				if state.sawAssertion {
+					return false, expr
+				}
+
+				if state.shouldAnnotate && !castType.TypeEqual(state.typ) {
+					state.shouldAnnotate = false
 					v.placeholders[arg.Name] = state
 				}
 			} else {
 				v.placeholders[arg.Name] = annotationState{
-					every: true,
-					typ:   castType,
+					shouldAnnotate: true,
+					typ:            castType,
 				}
 			}
 			return false, expr
 		}
 	case Placeholder:
-		v.placeholders[t.Name] = annotationState{every: false}
+		if state, ok := v.placeholders[t.Name]; !(ok && state.sawAssertion) {
+			// Ignore non-annotated placeholders once an assertion has been seen.
+			state.shouldAnnotate = false
+			v.placeholders[t.Name] = state
+		}
+		return false, expr
 	}
 	return true, expr
 }
@@ -1012,24 +1080,41 @@ func (*placeholderAnnotationVisitor) VisitPost(expr Expr) Expr { return expr }
 // - the placeholder is the subject of an explicit type annotation in at least one
 //   of its occurrences. If it is subject to multiple explicit type annotations where
 //   the types are not all in agreement, or if the placeholder already has an inferred
-//   type in the provided args map which conflicts with the explicit type annotation
+//   type in the placeholder map which conflicts with the explicit type annotation
 //   type, an error will be thrown.
 // - the placeholder is the subject to an implicit type annotation, meaning that it
 //   is not subject to an explicit type annotation, and that in all occurrences of the
 //   placeholder, it is subject to a cast to the same type. If it is subject to casts
 //   of multiple types, no error will be thrown, but the placeholder type will not be
-//   inferred. If a type has already been assigned for the placeholder in the provided
-//   args map, no error will be thrown, and the placeholder will keep it's previously
+//   inferred. If a type has already been assigned for the placeholder in the placeholder
+//   map, no error will be thrown, and the placeholder will keep it's previously
 //   inferred type.
 //
-// TODO(nvanbenschoten) Add support for explicit placeholder annotations.
 // TODO(nvanbenschoten) Can this visitor and map be preallocated (like normalizeVisitor)?
 func (p PlaceholderTypes) ProcessPlaceholderAnnotations(stmt Statement) error {
 	v := placeholderAnnotationVisitor{make(map[string]annotationState)}
+
+	// We treat existing inferred types in the MapPlaceholderTypes as initial assertions.
+	for placeholder, typ := range p {
+		v.placeholders[placeholder] = annotationState{
+			sawAssertion:   true,
+			shouldAnnotate: true,
+			typ:            typ,
+		}
+	}
+
 	WalkStmt(&v, stmt)
 	for placeholder, state := range v.placeholders {
-		if _, ok := p[placeholder]; !ok && state.every {
+		if state.shouldAnnotate {
 			p[placeholder] = state.typ
+		} else if state.sawAssertion {
+			// If we should not annotate the type but we did see a type assertion,
+			// there were conflicting type assertions.
+			if prevType, ok := p[placeholder]; ok {
+				return fmt.Errorf("found type annotation around %s that conflicts with previously "+
+					"inferred type %s", placeholder, prevType.Type())
+			}
+			return fmt.Errorf("found multiple conflicting type annotations around %s", placeholder)
 		}
 	}
 	return nil

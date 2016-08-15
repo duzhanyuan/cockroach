@@ -23,12 +23,13 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	csql "github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
@@ -126,7 +127,7 @@ func (mt mutationTest) makeMutationsActive() {
 		}
 	}
 	mt.tableDesc.Mutations = nil
-	if err := mt.tableDesc.Validate(); err != nil {
+	if err := mt.tableDesc.ValidateTable(); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -140,7 +141,7 @@ func (mt mutationTest) makeMutationsActive() {
 // writeColumnMutation adds column as a mutation and writes the
 // descriptor to the DB.
 func (mt mutationTest) writeColumnMutation(column string, m sqlbase.DescriptorMutation) {
-	_, i, err := mt.tableDesc.FindColumnByName(column)
+	_, i, err := mt.tableDesc.FindColumnByNormalizedName(column)
 	if err != nil {
 		mt.Fatal(err)
 	}
@@ -176,7 +177,7 @@ func (mt mutationTest) writeMutation(m sqlbase.DescriptorMutation) {
 		}
 	}
 	mt.tableDesc.Mutations = append(mt.tableDesc.Mutations, m)
-	if err := mt.tableDesc.Validate(); err != nil {
+	if err := mt.tableDesc.ValidateTable(); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -193,16 +194,18 @@ func TestOperationsWithColumnMutation(t *testing.T) {
 	// so disable leases on tables.
 	defer csql.TestDisableTableLeases()()
 	// Disable external processing of mutations.
-	ctx, _ := createTestServerContext()
-	ctx.TestingKnobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
+	params, _ := createTestServerParams()
+	params.Knobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
 		AsyncSchemaChangerExecNotification: schemaChangeManagerDisabled,
 	}
-	server, sqlDB, kvDB := setupWithContext(t, &ctx)
-	defer cleanup(server, sqlDB)
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop()
 
+	// Fix the column families so the key counts below don't change if the
+	// family heuristics are updated.
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i');
+CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i', FAMILY (k), FAMILY (v), FAMILY (i));
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +254,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i');
 			t.Fatal(err)
 		}
 		// Repeating the same without specifying the columns results in a different error.
-		if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ('b', 'y', 'i')`); !testutils.IsError(err, "INSERT has more expressions than target columns: 3/2") {
+		if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ('b', 'y', 'i')`); !testutils.IsError(err, "INSERT error: table t.test has 2 columns but 3 values were supplied") {
 			t.Fatal(err)
 		}
 		// Make column "i" live so that it is read.
@@ -333,21 +336,21 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i');
 	// Check that a mutation can only be inserted with an explicit mutation state, and direction.
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{}}
-	if err := tableDesc.Validate(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{Descriptor_: &sqlbase.DescriptorMutation_Column{Column: &tableDesc.Columns[len(tableDesc.Columns)-1]}}}
 	tableDesc.Columns = tableDesc.Columns[:len(tableDesc.Columns)-1]
-	if err := tableDesc.Validate(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, col i, id 3") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, col i, id 3") {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_DELETE_ONLY
-	if err := tableDesc.Validate(); !testutils.IsError(err, "mutation in state DELETE_ONLY, direction NONE, col i, id 3") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state DELETE_ONLY, direction NONE, col i, id 3") {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_UNKNOWN
 	tableDesc.Mutations[0].Direction = sqlbase.DescriptorMutation_DROP
-	if err := tableDesc.Validate(); !testutils.IsError(err, "mutation in state UNKNOWN, direction DROP, col i, id 3") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction DROP, col i, id 3") {
 		t.Fatal(err)
 	}
 }
@@ -356,7 +359,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i');
 // descriptor to the DB.
 func (mt mutationTest) writeIndexMutation(index string, m sqlbase.DescriptorMutation) {
 	tableDesc := mt.tableDesc
-	_, i, err := tableDesc.FindIndexByName(index)
+	_, i, err := tableDesc.FindIndexByNormalizedName(index)
 	if err != nil {
 		mt.Fatal(err)
 	}
@@ -371,12 +374,12 @@ func TestOperationsWithIndexMutation(t *testing.T) {
 	// The descriptor changes made must have an immediate effect.
 	defer csql.TestDisableTableLeases()()
 	// Disable external processing of mutations.
-	ctx, _ := createTestServerContext()
-	ctx.TestingKnobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
+	params, _ := createTestServerParams()
+	params.Knobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
 		AsyncSchemaChangerExecNotification: schemaChangeManagerDisabled,
 	}
-	server, sqlDB, kvDB := setupWithContext(t, &ctx)
-	defer cleanup(server, sqlDB)
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop()
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -481,7 +484,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{Descriptor_: &sqlbase.DescriptorMutation_Index{Index: &tableDesc.Indexes[len(tableDesc.Indexes)-1]}}}
 	tableDesc.Indexes = tableDesc.Indexes[:len(tableDesc.Indexes)-1]
-	if err := tableDesc.Validate(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
 		t.Fatal(err)
 	}
 }
@@ -494,17 +497,19 @@ func TestOperationsWithUniqueColumnMutation(t *testing.T) {
 	// so disable leases on tables.
 	defer csql.TestDisableTableLeases()()
 	// Disable external processing of mutations.
-	ctx, _ := createTestServerContext()
-	ctx.TestingKnobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
+	params, _ := createTestServerParams()
+	params.Knobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
 		AsyncSchemaChangerExecNotification: schemaChangeManagerDisabled,
 	}
-	server, sqlDB, kvDB := setupWithContext(t, &ctx)
-	defer cleanup(server, sqlDB)
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop()
 
-	// Create a table with column i and an index on v and i.
+	// Create a table with column i and an index on v and i. Fix the column
+	// families so the key counts below don't change if the family heuristics
+	// are updated.
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR, INDEX foo (i, v));
+CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR, INDEX foo (i, v), FAMILY (k), FAMILY (v), FAMILY (i));
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -642,12 +647,12 @@ func TestSchemaChangeCommandsWithPendingMutations(t *testing.T) {
 	// so disable leases on tables.
 	defer csql.TestDisableTableLeases()()
 	// Disable external processing of mutations.
-	ctx, _ := createTestServerContext()
-	ctx.TestingKnobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
+	params, _ := createTestServerParams()
+	params.Knobs.SQLSchemaChangeManager = &csql.SchemaChangeManagerTestingKnobs{
 		AsyncSchemaChangerExecNotification: schemaChangeManagerDisabled,
 	}
-	server, sqlDB, kvDB := setupWithContext(t, &ctx)
-	defer cleanup(server, sqlDB)
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop()
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -848,8 +853,8 @@ func TestTableMutationQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Disable synchronous and asynchronous schema change processing so that
 	// the mutations get queued up.
-	ctx, _ := createTestServerContext()
-	ctx.TestingKnobs = base.TestingKnobs{
+	params, _ := createTestServerParams()
+	params.Knobs = base.TestingKnobs{
 		SQLExecutor: &csql.ExecutorTestingKnobs{
 			SyncSchemaChangersFilter: func(tscc csql.TestingSchemaChangerCollection) {
 				tscc.ClearSchemaChangers()
@@ -859,9 +864,8 @@ func TestTableMutationQueue(t *testing.T) {
 			AsyncSchemaChangerExecNotification: schemaChangeManagerDisabled,
 		},
 	}
-
-	server, sqlDB, kvDB := setupWithContext(t, &ctx)
-	defer cleanup(server, sqlDB)
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop()
 
 	// Create a table with column i and an index on v and i.
 	if _, err := sqlDB.Exec(`
@@ -942,5 +946,51 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		if state := expected[i].state; m.State != state {
 			t.Errorf("%d entry: state %s, expected %s", i, m.State, state)
 		}
+	}
+}
+
+// TestAddingFKs checks the behavior of a table in the non-public `ADD` state.
+// Being non-public, it should not be visible to clients, and is therefore
+// assumed to be empty (e.g. by foreign key checks), since no one could have
+// written to it yet.
+func TestAddingFKs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := createTestServerParams()
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
+
+	if _, err := sqlDB.Exec(`
+		CREATE DATABASE t;
+		CREATE TABLE t.products (id INT PRIMARY KEY);
+		INSERT INTO t.products VALUES (1), (2);
+		CREATE TABLE t.orders (id INT PRIMARY KEY, product INT REFERENCES t.products, INDEX (product));
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step the referencing table back to the ADD state.
+	ordersDesc := sqlbase.GetTableDescriptor(kvDB, "t", "orders")
+	ordersDesc.State = sqlbase.TableDescriptor_ADD
+	ordersDesc.Version++
+	if err := kvDB.Put(
+		sqlbase.MakeDescMetadataKey(ordersDesc.ID),
+		sqlbase.WrapDescriptor(ordersDesc),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Generally a referenced table needs to lookup referencing tables to check
+	// FKs during delete operations, but referencing tables in the ADD state are
+	// given special treatment.
+	if _, err := sqlDB.Exec(`DELETE FROM t.products`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Client should not see the orders table.
+	if _, err := sqlDB.Exec(
+		`SELECT * FROM t.orders`,
+	); !testutils.IsError(err, "table is being added") {
+		t.Fatal(err)
 	}
 }

@@ -137,6 +137,14 @@ NULL
 43
 44
 
+# Check that a limit on the JOIN's result do not cause rows from the
+# JOIN operands to become invisible to the JOIN.
+query I colnames
+SELECT * FROM (SELECT x FROM onecolumn ORDER BY x DESC) NATURAL JOIN (VALUES (42)) AS v(x) LIMIT 1
+----
+x
+42
+
 statement ok
 CREATE TABLE empty (x INT)
 
@@ -267,10 +275,10 @@ query ITT
 EXPLAIN SELECT * FROM (onecolumn CROSS JOIN twocolumn JOIN onecolumn AS a(b) ON a.b=twocolumn.x JOIN twocolumn AS c(d,e) ON a.b=c.d AND c.d=onecolumn.x) LIMIT 1
 ----
 0  limit  count: 1
-1  join   INNER ON (a.b = c.d) AND (c.d = onecolumn.x)
-2  join   INNER ON a.b = twocolumn.x
+1  join   INNER ON (a.b = c.d) AND (c.d = test.onecolumn.x)
+2  join   INNER ON a.b = test.twocolumn.x
 3  join   CROSS
-4  scan   onecolumn@primary (max 1 row)
+4  scan   onecolumn@primary
 4  scan   twocolumn@primary
 3  scan   onecolumn@primary
 2  scan   twocolumn@primary
@@ -330,5 +338,5 @@ SELECT * FROM (onecolumn JOIN twocolumn USING(x) JOIN onecolumn USING(x))
 query error column reference.*is ambiguous
 SELECT * FROM (onecolumn AS a JOIN onecolumn AS b ON x > 32)
 
-query error qualified name.*not found
+query error column name.*not found
 SELECT * FROM (onecolumn AS a JOIN onecolumn AS b ON a.y > y)

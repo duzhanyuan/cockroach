@@ -76,6 +76,14 @@ type joinNode struct {
 	// emptyLeft contains tuples of NULL values to use
 	// on the left for full outer joins when the filter fails.
 	emptyLeft parser.DTuple
+
+	// explain indicates whether this node is running on behalf of
+	// EXPLAIN(DEBUG).
+	explain explainMode
+
+	// doneReadingRight is used by debugNext() and DebugValues() when
+	// explain == explainDebug.
+	doneReadingRight bool
 }
 
 type joinPredicate interface {
@@ -288,7 +296,7 @@ func pickUsingColumn(cols []ResultColumn, colName string, context string) (int, 
 		if col.hidden {
 			continue
 		}
-		if sqlbase.NormalizeName(col.Name) == colName {
+		if sqlbase.ReNormalizeName(col.Name) == colName {
 			idx = j
 		}
 	}
@@ -318,8 +326,8 @@ func (p *planner) makeUsingPredicate(
 	columns := make([]ResultColumn, 0, len(left.sourceColumns)+len(right.sourceColumns)-len(colNames))
 
 	// Find out which columns are involved in the USING clause.
-	for i, colName := range colNames {
-		colName = sqlbase.NormalizeName(colName)
+	for i, unnormalizedColName := range colNames {
+		colName := sqlbase.NormalizeName(unnormalizedColName)
 
 		// Check for USING(x,x)
 		if _, ok := seenNames[colName]; ok {
@@ -410,8 +418,8 @@ func (p *planner) makeUsingPredicate(
 
 // commonColumns returns the names of columns common on the
 // right and left sides, for use by NATURAL JOIN.
-func commonColumns(left, right *dataSourceInfo) []string {
-	var res []string
+func commonColumns(left, right *dataSourceInfo) parser.NameList {
+	var res parser.NameList
 	for _, cLeft := range left.sourceColumns {
 		if cLeft.hidden {
 			continue
@@ -421,9 +429,8 @@ func commonColumns(left, right *dataSourceInfo) []string {
 				continue
 			}
 
-			lName := sqlbase.NormalizeName(cLeft.Name)
-			if lName == sqlbase.NormalizeName(cRight.Name) {
-				res = append(res, lName)
+			if sqlbase.ReNormalizeName(cLeft.Name) == sqlbase.ReNormalizeName(cRight.Name) {
+				res = append(res, parser.Name(cLeft.Name))
 			}
 		}
 	}
@@ -507,9 +514,7 @@ func (n *joinNode) ExplainTypes(regTypes func(string, string)) {
 }
 
 // SetLimitHint implements the planNode interface.
-func (n *joinNode) SetLimitHint(numRows int64, soft bool) {
-	n.left.SetLimitHint(numRows, soft)
-}
+func (n *joinNode) SetLimitHint(numRows int64, soft bool) {}
 
 // expandPlan implements the planNode interface.
 func (n *joinNode) expandPlan() error {
@@ -563,6 +568,10 @@ func (n *joinNode) Ordering() orderingInfo { return n.left.Ordering() }
 
 // MarkDebug implements the planNode interface.
 func (n *joinNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	n.explain = mode
 	n.left.MarkDebug(mode)
 	n.right.MarkDebug(mode)
 }
@@ -580,23 +589,25 @@ func (n *joinNode) Start() error {
 		return err
 	}
 
-	// Load all the rows from the right side in memory.
-	v := &valuesNode{}
-	for {
-		hasRow, err := n.right.Next()
-		if err != nil {
-			return err
+	if n.explain != explainDebug {
+		// Load all the rows from the right side in memory.
+		v := &valuesNode{}
+		for {
+			hasRow, err := n.right.Next()
+			if err != nil {
+				return err
+			}
+			if !hasRow {
+				break
+			}
+			row := n.right.Values()
+			newRow := make([]parser.Datum, len(row))
+			copy(newRow, row)
+			v.rows = append(v.rows, newRow)
 		}
-		if !hasRow {
-			break
+		if len(v.rows) > 0 {
+			n.rightRows = v
 		}
-		row := n.right.Values()
-		newRow := make([]parser.Datum, len(row))
-		copy(newRow, row)
-		v.rows = append(v.rows, newRow)
-	}
-	if len(v.rows) > 0 {
-		n.rightRows = v
 	}
 
 	// Pre-allocate the space for output rows.
@@ -623,8 +634,27 @@ func (n *joinNode) Start() error {
 	return nil
 }
 
+func (n *joinNode) debugNext() (bool, error) {
+	if !n.doneReadingRight {
+		hasRightRow, err := n.right.Next()
+		if err != nil {
+			return false, err
+		}
+		if hasRightRow {
+			return true, nil
+		}
+		n.doneReadingRight = true
+	}
+
+	return n.left.Next()
+}
+
 // Next implements the planNode interface.
 func (n *joinNode) Next() (bool, error) {
+	if n.explain == explainDebug {
+		return n.debugNext()
+	}
+
 	var leftRow, rightRow parser.DTuple
 	var nRightRows int
 
@@ -733,7 +763,14 @@ func (n *joinNode) Values() parser.DTuple {
 
 // DebugValues implements the planNode interface.
 func (n *joinNode) DebugValues() debugValues {
-	// TODO(knz): not so clear yet how to report DebugValues()
-	// for JOIN.
-	return debugValues{}
+	var res debugValues
+	if !n.doneReadingRight {
+		res = n.right.DebugValues()
+	} else {
+		res = n.left.DebugValues()
+	}
+	if res.output == debugValueRow {
+		res.output = debugValueBuffered
+	}
+	return res
 }

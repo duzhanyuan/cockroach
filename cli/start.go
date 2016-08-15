@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"strings"
 	"syscall"
@@ -44,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util/envutil"
+	"github.com/cockroachdb/cockroach/util/grpcutil"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/sdnotify"
@@ -139,16 +141,16 @@ func initMemProfile(dir string) {
 		return
 	}
 	if min := time.Second; memProfileInterval < min {
-		log.Infof("fixing excessively short memory profiling interval: %s -> %s",
+		log.Infof(context.TODO(), "fixing excessively short memory profiling interval: %s -> %s",
 			memProfileInterval, min)
 		memProfileInterval = min
 	}
 
 	if jemallocHeapDump != nil {
-		log.Infof("writing go and jemalloc memory profiles to %s every %s", dir, memProfileInterval)
+		log.Infof(context.TODO(), "writing go and jemalloc memory profiles to %s every %s", dir, memProfileInterval)
 	} else {
-		log.Infof("writing go only memory profiles to %s every %s", dir, memProfileInterval)
-		log.Infof(`to enable jmalloc profiling: "export MALLOC_CONF=prof:true" or "ln -s prof:true /etc/malloc.conf"`)
+		log.Infof(context.TODO(), "writing go only memory profiles to %s every %s", dir, memProfileInterval)
+		log.Infof(context.TODO(), `to enable jmalloc profiling: "export MALLOC_CONF=prof:true" or "ln -s prof:true /etc/malloc.conf"`)
 	}
 
 	go func() {
@@ -166,7 +168,7 @@ func initMemProfile(dir string) {
 				if jemallocHeapDump != nil {
 					jepath := filepath.Join(dir, "jeprof."+suffix)
 					if err := jemallocHeapDump(jepath); err != nil {
-						log.Warningf("error writing jemalloc heap %s: %s", jepath, err)
+						log.Warningf(context.TODO(), "error writing jemalloc heap %s: %s", jepath, err)
 					}
 				}
 
@@ -174,12 +176,12 @@ func initMemProfile(dir string) {
 				// Try writing a go heap profile.
 				f, err := os.Create(path)
 				if err != nil {
-					log.Warningf("error creating go heap file %s", err)
+					log.Warningf(context.TODO(), "error creating go heap file %s", err)
 					return
 				}
 				defer f.Close()
 				if err = pprof.WriteHeapProfile(f); err != nil {
-					log.Warningf("error writing go heap %s: %s", path, err)
+					log.Warningf(context.TODO(), "error writing go heap %s: %s", path, err)
 					return
 				}
 			}()
@@ -193,7 +195,7 @@ func initCPUProfile(dir string) {
 		return
 	}
 	if min := time.Second; cpuProfileInterval < min {
-		log.Infof("fixing excessively short cpu profiling interval: %s -> %s",
+		log.Infof(context.TODO(), "fixing excessively short cpu profiling interval: %s -> %s",
 			cpuProfileInterval, min)
 		cpuProfileInterval = min
 	}
@@ -216,7 +218,7 @@ func initCPUProfile(dir string) {
 				suffix := timeutil.Now().Add(cpuProfileInterval).Format(format)
 				f, err := os.Create(filepath.Join(dir, "cpuprof."+suffix))
 				if err != nil {
-					log.Warningf("error creating go cpu file %s", err)
+					log.Warningf(context.TODO(), "error creating go cpu file %s", err)
 					return
 				}
 
@@ -229,7 +231,7 @@ func initCPUProfile(dir string) {
 
 				// Start the new profile.
 				if err := pprof.StartCPUProfile(f); err != nil {
-					log.Warningf("unable to start cpu profile: %v", err)
+					log.Warningf(context.TODO(), "unable to start cpu profile: %v", err)
 					f.Close()
 					return
 				}
@@ -241,13 +243,27 @@ func initCPUProfile(dir string) {
 	}()
 }
 
+func initBlockProfile() {
+	// Enable the block profile for a sample of mutex and channel operations.
+	// Smaller values provide more accurate profiles but are more
+	// expensive. 0 and 1 are special: 0 disables the block profile and
+	// 1 captures 100% of block events. For other values, the profiler
+	// will sample one event per X nanoseconds spent blocking.
+	//
+	// The block profile can be viewed with `go tool pprof
+	// http://HOST:PORT/debug/pprof/block`
+	d := envutil.EnvOrDefaultInt64("block_profile_rate",
+		10000000 /* 1 sample per 10 milliseconds spent blocking */)
+	runtime.SetBlockProfileRate(int(d))
+}
+
 func initCheckpointing(engines []engine.Engine) {
 	checkpointInterval := envutil.EnvOrDefaultDuration("checkpoint_interval", -1)
 	if checkpointInterval < 0 {
 		return
 	}
 	if min := 10 * time.Second; checkpointInterval < min {
-		log.Infof("fixing excessively short checkpointing interval: %s -> %s",
+		log.Infof(context.TODO(), "fixing excessively short checkpointing interval: %s -> %s",
 			checkpointInterval, min)
 		checkpointInterval = min
 	}
@@ -266,10 +282,10 @@ func initCheckpointing(engines []engine.Engine) {
 				// Note that when dir is relative (as it is here) it is appended to the
 				// engine's data directory.
 				if err := e.Checkpoint(dir); err != nil {
-					log.Warning(err)
+					log.Warning(context.TODO(), err)
 				}
 			}
-			log.Infof("created checkpoint %s: %.1fms", dir, timeutil.Since(start).Seconds()*1000)
+			log.Infof(context.TODO(), "created checkpoint %s: %.1fms", dir, timeutil.Since(start).Seconds()*1000)
 		}
 	}()
 }
@@ -307,22 +323,24 @@ func runStart(_ *cobra.Command, args []string) error {
 	}
 
 	// Make sure the path exists.
-	if err := os.MkdirAll(f.Value.String(), 0755); err != nil {
+	logDir := f.Value.String()
+	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return err
 	}
 
 	// We log build information to stdout (for the short summary), but also
 	// to stderr to coincide with the full logs.
 	info := build.GetInfo()
-	log.Infof(info.Short())
+	log.Infof(context.TODO(), info.Short())
 
 	initMemProfile(f.Value.String())
 	initCPUProfile(f.Value.String())
+	initBlockProfile()
 
 	// Default user for servers.
 	serverCtx.User = security.NodeUser
 
-	stopper := stop.NewStopper()
+	stopper := initBacktrace(logDir)
 	if err := serverCtx.InitStores(stopper); err != nil {
 		return fmt.Errorf("failed to initialize stores: %s", err)
 	}
@@ -331,7 +349,7 @@ func runStart(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize node: %s", err)
 	}
 
-	log.Info("starting cockroach node")
+	log.Info(context.TODO(), "starting cockroach node")
 	s, err := server.NewServer(serverCtx, stopper)
 	if err != nil {
 		return fmt.Errorf("failed to start Cockroach server: %s", err)
@@ -365,6 +383,9 @@ func runStart(_ *cobra.Command, args []string) error {
 	for i, spec := range serverCtx.Stores.Specs {
 		fmt.Fprintf(tw, "store[%d]:\t%s\n", i, spec)
 	}
+	for i, address := range serverCtx.JoinList {
+		fmt.Fprintf(tw, "join[%d]:\t%s\n", i, address)
+	}
 	if err := tw.Flush(); err != nil {
 		return err
 	}
@@ -381,14 +402,14 @@ func runStart(_ *cobra.Command, args []string) error {
 	case <-signalCh:
 		go func() {
 			if _, err := s.Drain(server.GracefulDrainModes); err != nil {
-				log.Warning(err)
+				log.Warning(context.TODO(), err)
 			}
 			s.Stop()
 		}()
 	}
 
 	const msgDrain = "initiating graceful shutdown of server"
-	log.Info(msgDrain)
+	log.Info(context.TODO(), msgDrain)
 	fmt.Fprintln(os.Stdout, msgDrain)
 
 	go func() {
@@ -398,9 +419,9 @@ func runStart(_ *cobra.Command, args []string) error {
 			select {
 			case <-ticker.C:
 				if log.V(1) {
-					log.Infof("running tasks:\n%s", stopper.RunningTasks())
+					log.Infof(context.TODO(), "running tasks:\n%s", stopper.RunningTasks())
 				}
-				log.Infof("%d running tasks", stopper.NumTasks())
+				log.Infof(context.TODO(), "%d running tasks", stopper.NumTasks())
 			case <-stopper.ShouldStop():
 				return
 			}
@@ -409,12 +430,12 @@ func runStart(_ *cobra.Command, args []string) error {
 
 	select {
 	case <-signalCh:
-		log.Errorf("second signal received, initiating hard shutdown")
+		log.Errorf(context.TODO(), "second signal received, initiating hard shutdown")
 	case <-time.After(time.Minute):
-		log.Errorf("time limit reached, initiating hard shutdown")
+		log.Errorf(context.TODO(), "time limit reached, initiating hard shutdown")
 	case <-stopper.IsStopped():
 		const msgDone = "server drained and shutdown completed"
-		log.Infof(msgDone)
+		log.Infof(context.TODO(), msgDone)
 		fmt.Fprintln(os.Stdout, msgDone)
 	}
 	log.Flush()
@@ -479,6 +500,31 @@ completed, the server exits.
 	RunE:         runQuit,
 }
 
+// doShutdown attempts to trigger server shutdown. The string return
+// value, if non-empty, indicates a reason why the state may be
+// uncertain and thus that it may make sense to retry the shutdown.
+func doShutdown(c serverpb.AdminClient, ctx context.Context, onModes []int32) (string, error) {
+	stream, err := c.Drain(ctx, &serverpb.DrainRequest{
+		On:       onModes,
+		Shutdown: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	_, err = stream.Recv()
+	if err == nil {
+		for {
+			if _, err := stream.Recv(); !grpcutil.IsClosedConnection(err) {
+				return "", err
+			}
+			break
+		}
+		fmt.Println("ok")
+		return "", nil
+	}
+	return fmt.Sprintf("%v", err), nil
+}
+
 // runQuit accesses the quit shutdown path.
 func runQuit(_ *cobra.Command, _ []string) error {
 	onModes := make([]int32, len(server.GracefulDrainModes))
@@ -494,18 +540,20 @@ func runQuit(_ *cobra.Command, _ []string) error {
 
 	ctx := stopperContext(stopper)
 
-	if _, err := c.Drain(ctx, &serverpb.DrainRequest{
-		On:       onModes,
-		Shutdown: true,
-	}); err != nil {
-		fmt.Printf("graceful shutdown failed, proceeding with hard shutdown: %v\n", err)
-		if _, err := c.Drain(ctx, &serverpb.DrainRequest{
-			Shutdown: true,
-		}); err != nil {
-			return err
+	retry, err := doShutdown(c, ctx, onModes)
+	if err != nil {
+		return err
+	}
+	if retry != "" {
+		fmt.Fprintf(os.Stderr, "graceful shutdown failed, proceeding with hard shutdown: %s\n", retry)
+
+		// Not passing drain modes tells the server to not bother and go
+		// straight to shutdown.
+		_, err := doShutdown(c, ctx, nil)
+		if err != nil {
+			return fmt.Errorf("hard shutdown failed: %v", err)
 		}
 	}
-	fmt.Println("ok")
 	return nil
 }
 

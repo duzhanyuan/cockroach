@@ -21,15 +21,18 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/storage/storagebase"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 func TestQueryCounts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, sqlDB, _ := setup(t)
-	defer cleanup(s, sqlDB)
+	params, _ := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
 
 	var testcases = []struct {
 		query            string
@@ -71,16 +74,16 @@ func TestQueryCounts(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		checkCounterEQ(t, s, "txn.begin.count", tc.txnBeginCount)
-		checkCounterEQ(t, s, "select.count", tc.selectCount)
-		checkCounterEQ(t, s, "update.count", tc.updateCount)
-		checkCounterEQ(t, s, "insert.count", tc.insertCount)
-		checkCounterEQ(t, s, "delete.count", tc.deleteCount)
-		checkCounterEQ(t, s, "ddl.count", tc.ddlCount)
-		checkCounterEQ(t, s, "misc.count", tc.miscCount)
-		checkCounterEQ(t, s, "txn.commit.count", tc.txnCommitCount)
-		checkCounterEQ(t, s, "txn.rollback.count", tc.txnRollbackCount)
-		checkCounterEQ(t, s, "txn.abort.count", 0)
+		checkCounterEQ(t, s, sql.MetaTxnBegin, tc.txnBeginCount)
+		checkCounterEQ(t, s, sql.MetaTxnCommit, tc.txnCommitCount)
+		checkCounterEQ(t, s, sql.MetaTxnRollback, tc.txnRollbackCount)
+		checkCounterEQ(t, s, sql.MetaTxnAbort, 0)
+		checkCounterEQ(t, s, sql.MetaSelect, tc.selectCount)
+		checkCounterEQ(t, s, sql.MetaUpdate, tc.updateCount)
+		checkCounterEQ(t, s, sql.MetaInsert, tc.insertCount)
+		checkCounterEQ(t, s, sql.MetaDelete, tc.deleteCount)
+		checkCounterEQ(t, s, sql.MetaDdl, tc.ddlCount)
+		checkCounterEQ(t, s, sql.MetaMisc, tc.miscCount)
 
 		// Everything after this query will also fail, so quit now to avoid deluge of errors.
 		if t.Failed() {
@@ -92,9 +95,9 @@ func TestQueryCounts(t *testing.T) {
 func TestAbortCountConflictingWrites(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx, cmdFilters := createTestServerContext()
-	s, sqlDB, _ := setupWithContext(t, &ctx)
-	defer cleanup(s, sqlDB)
+	params, cmdFilters := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
 
 	if _, err := sqlDB.Exec("CREATE DATABASE db"); err != nil {
 		t.Fatal(err)
@@ -131,19 +134,20 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	checkCounterEQ(t, s, "txn.abort.count", 1)
-	checkCounterEQ(t, s, "txn.begin.count", 1)
-	checkCounterEQ(t, s, "txn.rollback.count", 0)
-	checkCounterEQ(t, s, "txn.commit.count", 0)
-	checkCounterEQ(t, s, "insert.count", 1)
+	checkCounterEQ(t, s, sql.MetaTxnAbort, 1)
+	checkCounterEQ(t, s, sql.MetaTxnBegin, 1)
+	checkCounterEQ(t, s, sql.MetaTxnRollback, 0)
+	checkCounterEQ(t, s, sql.MetaTxnCommit, 0)
+	checkCounterEQ(t, s, sql.MetaInsert, 1)
 }
 
 // TestErrorDuringTransaction tests that the transaction abort count goes up when a query
 // results in an error during a txn.
 func TestAbortCountErrorDuringTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, sqlDB, _ := setup(t)
-	defer cleanup(s, sqlDB)
+	params, _ := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
 
 	txn, err := sqlDB.Begin()
 	if err != nil {
@@ -154,7 +158,7 @@ func TestAbortCountErrorDuringTransaction(t *testing.T) {
 		t.Fatal("Expected an error but didn't get one")
 	}
 
-	checkCounterEQ(t, s, "txn.abort.count", 1)
-	checkCounterEQ(t, s, "txn.begin.count", 1)
-	checkCounterEQ(t, s, "select.count", 1)
+	checkCounterEQ(t, s, sql.MetaTxnAbort, 1)
+	checkCounterEQ(t, s, sql.MetaTxnBegin, 1)
+	checkCounterEQ(t, s, sql.MetaSelect, 1)
 }

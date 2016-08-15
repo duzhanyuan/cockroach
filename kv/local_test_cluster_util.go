@@ -22,8 +22,8 @@ import (
 	opentracing "github.com/opentracing/opentracing-go"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util/hlc"
@@ -58,13 +58,13 @@ func InitSenderForLocalTestCluster(
 	gossip *gossip.Gossip,
 ) client.Sender {
 	retryOpts := base.DefaultRetryOptions()
-	retryOpts.Closer = stopper.ShouldDrain()
+	retryOpts.Closer = stopper.ShouldQuiesce()
 	senderTransportFactory := SenderTransportFactory(tracer, stores)
-	distSender := NewDistSender(&DistSenderContext{
+	distSender := NewDistSender(&DistSenderConfig{
 		Clock: clock,
 		RangeDescriptorCacheSize: defaultRangeDescriptorCacheSize,
 		RangeLookupMaxRanges:     defaultRangeLookupMaxRanges,
-		LeaderCacheSize:          defaultLeaderCacheSize,
+		LeaseHolderCacheSize:     defaultLeaseHolderCacheSize,
 		RPCRetryOptions:          &retryOpts,
 		nodeDescriptor:           nodeDesc,
 		TransportFactory: func(

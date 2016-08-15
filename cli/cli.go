@@ -79,6 +79,7 @@ func init() {
 		userCmd,
 		zoneCmd,
 		nodeCmd,
+		dumpCmd,
 
 		// Miscellaneous commands.
 		// TODO(pmattis): stats
@@ -86,6 +87,7 @@ func init() {
 		versionCmd,
 		debugCmd,
 	)
+	cockroachCmd.AddCommand(backupCmds...)
 }
 
 // Run ...

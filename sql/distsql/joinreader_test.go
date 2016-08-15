@@ -21,9 +21,11 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
@@ -31,8 +33,8 @@ import (
 func TestJoinReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	_, sqlDB, kvDB, cleanup := sqlutils.SetupServer(t)
-	defer cleanup()
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	// Create a table where each row is:
 	//
@@ -97,6 +99,11 @@ func TestJoinReader(t *testing.T) {
 		js.Table = *td
 
 		txn := client.NewTxn(context.Background(), *kvDB)
+		flowCtx := FlowCtx{
+			Context: context.Background(),
+			evalCtx: &parser.EvalContext{},
+			txn:     txn,
+		}
 
 		in := &RowBuffer{}
 		for _, row := range c.input {
@@ -108,7 +115,7 @@ func TestJoinReader(t *testing.T) {
 		}
 
 		out := &RowBuffer{}
-		jr, err := newJoinReader(&js, txn, in, out, &parser.EvalContext{})
+		jr, err := newJoinReader(&flowCtx, &js, in, out)
 		if err != nil {
 			t.Fatal(err)
 		}

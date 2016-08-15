@@ -40,7 +40,7 @@ import (
 var maxResults int64
 
 var connURL string
-var connUser, connHost, connPort, httpPort, connDBName string
+var connUser, connHost, connPort, httpPort, httpAddr, connDBName, zoneConfig string
 var startBackground bool
 var undoFreezeCluster bool
 
@@ -71,6 +71,9 @@ nodes. For example:`) + `
   --attrs=us-west-1b:gpu
 `,
 
+	cliflags.ZoneConfigName: wrapText(`
+File to read the zone configuration from. Specify "-" to read from standard input.`),
+
 	cliflags.BackgroundName: wrapText(`
 Start the server in the background. This is similar to appending "&"
 to the command line, but when the server is started with --background,
@@ -92,6 +95,9 @@ Database server port to connect to.`),
 	forClient(cliflags.HTTPPortName): wrapText(`
 Database server port to connect to for HTTP requests.`),
 
+	forClient(cliflags.HTTPAddrName): wrapText(`
+Database server (hostname or IP address) to connect to for HTTP requests.`),
+
 	cliflags.DatabaseName: wrapText(`
 The name of the database to connect to.`),
 
@@ -106,15 +112,25 @@ with a non-zero status code and further statements are not executed. The
 results of each SQL statement are printed on the standard output.`),
 
 	cliflags.PrettyName: wrapText(`
-Causes table rows to be formatted as tables using ASCII art. 
+Causes table rows to be formatted as tables using ASCII art.
 When not specified, table rows are printed as tab-separated values (TSV).`),
 
 	cliflags.JoinName: wrapText(`
-A comma-separated list of addresses to use when a new node is joining
-an existing cluster. For the first node in a cluster, --join should
-NOT be specified. Each address in the list has an optional type:
-[type=]<address>. An unspecified type means ip address or dns. Type
-is one of:`) + `
+The address of node which acts as bootstrap when a new node is
+joining an existing cluster. This flag can be specified
+separately for each address, for example:`) + `
+
+  --join=localhost:1234 --join=localhost:2345
+
+` + wrapText(`
+Or can be specified as a comma separated list in single flag,
+or both forms can be used together, for example:`) + `
+
+  --join=localhost:1234,localhost:2345 --join=localhost:3456
+
+` + wrapText(`
+Each address in the list has an optional type: [type=]<address>.
+An unspecified type means ip address or dns. Type is one of:`) + `
 
   - tcp: (default if type is omitted): plain ip address or hostname.
   - http-lb: HTTP load balancer: we query
@@ -130,6 +146,9 @@ The port to bind to.`),
 
 	forServer(cliflags.HTTPPortName): wrapText(`
 The port to bind to for HTTP requests.`),
+
+	forServer(cliflags.HTTPAddrName): wrapText(`
+The hostname or IP address to bind to for HTTP requests.`),
 
 	cliflags.SocketName: wrapText(`
 Unix socket file, postgresql protocol only.
@@ -235,6 +254,9 @@ Exclusive end key and format as [<format>:]<key>. Supported formats:
 
 	cliflags.ValuesName: wrapText(`
 Print values along with their associated key.`),
+
+	cliflags.SizesName: wrapText(`
+Print key and value sizes along with their associated key.`),
 
 	cliflags.RaftTickIntervalName: wrapText(`
 The resolution of the Raft timer; other raft timeouts are
@@ -387,6 +409,7 @@ func init() {
 		f.StringVar(&connHost, cliflags.HostName, "", usageNoEnv(forServer(cliflags.HostName)))
 		f.StringVarP(&connPort, cliflags.PortName, "p", base.DefaultPort, usageNoEnv(forServer(cliflags.PortName)))
 		f.StringVar(&httpPort, cliflags.HTTPPortName, base.DefaultHTTPPort, usageNoEnv(forServer(cliflags.HTTPPortName)))
+		f.StringVar(&httpAddr, cliflags.HTTPAddrName, "", usageNoEnv(forServer(cliflags.HTTPAddrName)))
 		f.StringVar(&serverCtx.Attrs, cliflags.AttrsName, serverCtx.Attrs, usageNoEnv(cliflags.AttrsName))
 		f.VarP(&serverCtx.Stores, cliflags.StoreName, "s", usageNoEnv(cliflags.StoreName))
 		f.DurationVar(&serverCtx.RaftTickInterval, cliflags.RaftTickIntervalName, base.DefaultRaftTickInterval, usageNoEnv(cliflags.RaftTickIntervalName))
@@ -408,7 +431,7 @@ func init() {
 		f.StringVar(&baseCtx.SSLCertKey, cliflags.KeyName, baseCtx.SSLCertKey, usageNoEnv(cliflags.KeyName))
 
 		// Cluster joining flags.
-		f.StringVar(&serverCtx.JoinUsing, cliflags.JoinName, serverCtx.JoinUsing, usageNoEnv(cliflags.JoinName))
+		f.VarP(&serverCtx.JoinList, cliflags.JoinName, "j", usageNoEnv(cliflags.JoinName))
 
 		// Engine flags.
 		setDefaultCacheSize(&serverCtx)
@@ -429,13 +452,14 @@ func init() {
 	setUserCmd.Flags().StringVar(&password, cliflags.PasswordName, envutil.EnvOrDefaultString(cliflags.PasswordName, ""), usageEnv(cliflags.PasswordName))
 
 	clientCmds := []*cobra.Command{
-		sqlShellCmd, quitCmd, freezeClusterCmd, /* startCmd is covered above */
+		sqlShellCmd, quitCmd, freezeClusterCmd, dumpCmd, /* startCmd is covered above */
 	}
 	clientCmds = append(clientCmds, kvCmds...)
 	clientCmds = append(clientCmds, rangeCmds...)
 	clientCmds = append(clientCmds, userCmds...)
 	clientCmds = append(clientCmds, zoneCmds...)
 	clientCmds = append(clientCmds, nodeCmds...)
+	clientCmds = append(clientCmds, backupCmds...)
 	for _, cmd := range clientCmds {
 		f := cmd.PersistentFlags()
 		f.StringVar(&connHost, cliflags.HostName, envutil.EnvOrDefaultString(cliflags.HostName, ""), usageEnv(forClient(cliflags.HostName)))
@@ -453,7 +477,10 @@ func init() {
 		// to a file. The user can override with --pretty.
 		f.BoolVar(&cliCtx.prettyFmt, cliflags.PrettyName, isInteractive, usageNoEnv(cliflags.PrettyName))
 	}
-
+	{
+		f := setZoneCmd.Flags()
+		f.StringVarP(&zoneConfig, cliflags.ZoneConfigName, "f", "", usageNoEnv(cliflags.ZoneConfigName))
+	}
 	{
 		f := sqlShellCmd.Flags()
 		f.VarP(&sqlCtx.execStmts, cliflags.ExecuteName, "e", usageNoEnv(cliflags.ExecuteName))
@@ -474,7 +501,7 @@ func init() {
 	}
 
 	// Commands that establish a SQL connection.
-	sqlCmds := []*cobra.Command{sqlShellCmd}
+	sqlCmds := []*cobra.Command{sqlShellCmd, dumpCmd}
 	sqlCmds = append(sqlCmds, zoneCmds...)
 	sqlCmds = append(sqlCmds, userCmds...)
 	for _, cmd := range sqlCmds {
@@ -498,6 +525,7 @@ func init() {
 		f.Var((*mvccKey)(&debugCtx.startKey), cliflags.FromName, usageNoEnv(cliflags.FromName))
 		f.Var((*mvccKey)(&debugCtx.endKey), cliflags.ToName, usageNoEnv(cliflags.ToName))
 		f.BoolVar(&debugCtx.values, cliflags.ValuesName, false, usageNoEnv(cliflags.ValuesName))
+		f.BoolVar(&debugCtx.sizes, cliflags.SizesName, false, usageNoEnv(cliflags.SizesName))
 	}
 
 	{
@@ -505,16 +533,22 @@ func init() {
 		f.BoolVar(&versionIncludesDeps, cliflags.DepsName, false, usageNoEnv(cliflags.DepsName))
 	}
 
-	cobra.OnInitialize(func() {
-		// If any of the security flags have been set, clear the insecure
-		// setting. Note that we do the inverse when the --insecure flag is
-		// set. See insecureValue.Set().
-		if baseCtx.SSLCA != "" || baseCtx.SSLCAKey != "" ||
-			baseCtx.SSLCert != "" || baseCtx.SSLCertKey != "" {
-			baseCtx.Insecure = false
-		}
+	cobra.OnInitialize(extraFlagInit)
+}
 
-		serverCtx.Addr = net.JoinHostPort(connHost, connPort)
-		serverCtx.HTTPAddr = net.JoinHostPort(connHost, httpPort)
-	})
+// extraFlagInit is a standalone function so we can test more easily.
+func extraFlagInit() {
+	// If any of the security flags have been set, clear the insecure
+	// setting. Note that we do the inverse when the --insecure flag is
+	// set. See insecureValue.Set().
+	if baseCtx.SSLCA != "" || baseCtx.SSLCAKey != "" ||
+		baseCtx.SSLCert != "" || baseCtx.SSLCertKey != "" {
+		baseCtx.Insecure = false
+	}
+
+	serverCtx.Addr = net.JoinHostPort(connHost, connPort)
+	if httpAddr == "" {
+		httpAddr = connHost
+	}
+	serverCtx.HTTPAddr = net.JoinHostPort(httpAddr, httpPort)
 }

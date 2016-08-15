@@ -19,7 +19,9 @@ package sql
 import (
 	"sort"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
@@ -34,7 +36,7 @@ func makeColIDtoRowIndex(row planNode, desc *sqlbase.TableDescriptor) (
 	columns := row.Columns()
 	colIDtoRowIndex := make(map[sqlbase.ColumnID]int, len(columns))
 	for i, column := range columns {
-		s, idx, err := desc.FindColumnByName(column.Name)
+		s, idx, err := desc.FindColumnByNormalizedName(sqlbase.ReNormalizeName(column.Name))
 		if err != nil {
 			return nil, err
 		}
@@ -110,8 +112,8 @@ func (sc *SchemaChanger) runBackfill(lease *sqlbase.TableDescriptor_SchemaChange
 	var droppedIndexDescs []sqlbase.IndexDescriptor
 	var addedColumnDescs []sqlbase.ColumnDescriptor
 	var addedIndexDescs []sqlbase.IndexDescriptor
-	if err := sc.db.Txn(func(txn *client.Txn) error {
-		tableDesc, err := getTableDescFromID(txn, sc.tableID)
+	if err := sc.db.Txn(context.TODO(), func(txn *client.Txn) error {
+		tableDesc, err := sqlbase.GetTableDescFromID(txn, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -172,14 +174,14 @@ func (sc *SchemaChanger) runBackfill(lease *sqlbase.TableDescriptor_SchemaChange
 // getTableSpan returns a span containing the start and end key for a table.
 func (sc *SchemaChanger) getTableSpan() (sqlbase.Span, error) {
 	var tableDesc *sqlbase.TableDescriptor
-	if err := sc.db.Txn(func(txn *client.Txn) error {
+	if err := sc.db.Txn(context.TODO(), func(txn *client.Txn) error {
 		var err error
-		tableDesc, err = getTableDescFromID(txn, sc.tableID)
+		tableDesc, err = sqlbase.GetTableDescFromID(txn, sc.tableID)
 		return err
 	}); err != nil {
 		return sqlbase.Span{}, err
 	}
-	prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(tableDesc.ID, tableDesc.PrimaryIndex.ID))
+	prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID))
 	return sqlbase.Span{
 		Start: prefix,
 		End:   prefix.PrefixEnd(),
@@ -256,8 +258,8 @@ func (sc *SchemaChanger) truncateAndBackfillColumnsChunk(
 ) (roachpb.Key, bool, error) {
 	var curIndexKey roachpb.Key
 	done := false
-	err := sc.db.Txn(func(txn *client.Txn) error {
-		tableDesc, err := getTableDescFromID(txn, sc.tableID)
+	err := sc.db.Txn(context.TODO(), func(txn *client.Txn) error {
+		tableDesc, err := sqlbase.GetTableDescFromID(txn, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -268,11 +270,13 @@ func (sc *SchemaChanger) truncateAndBackfillColumnsChunk(
 		}
 
 		updateCols := append(added, dropped...)
-		fkTables := TablesNeededForFKs(*tableDesc, CheckUpdates)
+		fkTables := tablesNeededForFKs(*tableDesc, CheckUpdates)
 		for k := range fkTables {
-			if fkTables[k], err = getTableDescFromID(txn, k); err != nil {
+			table, err := sqlbase.GetTableDescFromID(txn, k)
+			if err != nil {
 				return err
 			}
+			fkTables[k] = tableLookup{table: table}
 		}
 		// TODO(dan): Tighten up the bound on the requestedCols parameter to
 		// makeRowUpdater.
@@ -314,7 +318,7 @@ func (sc *SchemaChanger) truncateAndBackfillColumnsChunk(
 			return err
 		}
 
-		indexKeyPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc.ID, tableDesc.PrimaryIndex.ID)
+		indexKeyPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
 		oldValues := make(parser.DTuple, len(ru.fetchCols))
 		updateValues := make(parser.DTuple, len(updateCols))
 
@@ -330,7 +334,7 @@ func (sc *SchemaChanger) truncateAndBackfillColumnsChunk(
 			}
 
 			curIndexKey, _, err = sqlbase.EncodeIndexKey(
-				&tableDesc.PrimaryIndex, colIDtoRowIndex, row, indexKeyPrefix)
+				tableDesc, &tableDesc.PrimaryIndex, colIDtoRowIndex, row, indexKeyPrefix)
 
 			for j, col := range added {
 				if defaultExprs == nil || defaultExprs[j] == nil {
@@ -353,7 +357,7 @@ func (sc *SchemaChanger) truncateAndBackfillColumnsChunk(
 			for j := len(row); j < len(oldValues); j++ {
 				oldValues[j] = parser.DNull
 			}
-			if _, err := ru.updateRow(writeBatch, oldValues, updateValues); err != nil {
+			if _, err := ru.updateRow(context.TODO(), writeBatch, oldValues, updateValues); err != nil {
 				return err
 			}
 		}
@@ -380,8 +384,8 @@ func (sc *SchemaChanger) truncateIndexes(
 			return err
 		}
 		*lease = l
-		if err := sc.db.Txn(func(txn *client.Txn) error {
-			tableDesc, err := getTableDescFromID(txn, sc.tableID)
+		if err := sc.db.Txn(context.TODO(), func(txn *client.Txn) error {
+			tableDesc, err := sqlbase.GetTableDescFromID(txn, sc.tableID)
 			if err != nil {
 				return err
 			}
@@ -390,21 +394,15 @@ func (sc *SchemaChanger) truncateIndexes(
 				return nil
 			}
 
-			indexPrefix := sqlbase.MakeIndexKeyPrefix(tableDesc.ID, desc.ID)
-
-			// Delete the index.
-			indexStartKey := roachpb.Key(indexPrefix)
-			indexEndKey := indexStartKey.PrefixEnd()
-			if log.V(2) {
-				log.Infof("DelRange %s - %s", indexStartKey, indexEndKey)
-			}
-			b := &client.Batch{}
-			b.DelRange(indexStartKey, indexEndKey, false)
-
-			if err := txn.Run(b); err != nil {
+			rd, err := makeRowDeleter(txn, tableDesc, nil, nil, false)
+			if err != nil {
 				return err
 			}
-			return nil
+			td := tableDeleter{rd: rd}
+			if err := td.init(txn); err != nil {
+				return err
+			}
+			return td.deleteIndex(context.TODO(), &desc)
 		}); err != nil {
 			return err
 		}
@@ -457,8 +455,8 @@ func (sc *SchemaChanger) backfillIndexesChunk(
 ) (roachpb.Key, bool, error) {
 	var nextKey roachpb.Key
 	done := false
-	err := sc.db.Txn(func(txn *client.Txn) error {
-		tableDesc, err := getTableDescFromID(txn, sc.tableID)
+	err := sc.db.Txn(context.TODO(), func(txn *client.Txn) error {
+		tableDesc, err := sqlbase.GetTableDescFromID(txn, sc.tableID)
 		if err != nil {
 			return err
 		}
@@ -471,13 +469,13 @@ func (sc *SchemaChanger) backfillIndexesChunk(
 		// Get the next set of rows.
 		// TODO(tamird): Support partial indexes?
 		//
-		// Use a scanNode with SELECT to pass in a sqlbase.TableDescriptor to the
-		// SELECT without needing to use a parser.QualifiedName, because we
-		// want to run schema changes from a gossip feed of table IDs. Running
-		// the scan and applying the changes in many transactions is fine
-		// because the schema change is in the correct state to handle
-		// intermediate OLTP commands which delete and add values during the
-		// scan.
+		// Use a scanNode with SELECT to pass in a sqlbase.TableDescriptor
+		// to the SELECT without needing to go through table name
+		// resolution, because we want to run schema changes from a gossip
+		// feed of table IDs. Running the scan and applying the changes in
+		// many transactions is fine because the schema change is in the
+		// correct state to handle intermediate OLTP commands which delete
+		// and add values during the scan.
 		planner := makePlanner()
 		planner.setTxn(txn)
 		scan := planner.Scan()
@@ -513,14 +511,14 @@ func (sc *SchemaChanger) backfillIndexesChunk(
 			for _, desc := range added {
 				secondaryIndexEntries := make([]sqlbase.IndexEntry, 1)
 				err := sqlbase.EncodeSecondaryIndexes(
-					tableDesc.ID, []sqlbase.IndexDescriptor{desc}, colIDtoRowIndex,
+					tableDesc, []sqlbase.IndexDescriptor{desc}, colIDtoRowIndex,
 					rowVals, secondaryIndexEntries)
 				if err != nil {
 					return err
 				}
 				for _, secondaryIndexEntry := range secondaryIndexEntries {
 					if log.V(2) {
-						log.Infof("InitPut %s -> %v", secondaryIndexEntry.Key,
+						log.Infof(context.TODO(), "InitPut %s -> %v", secondaryIndexEntry.Key,
 							secondaryIndexEntry.Value)
 					}
 					b.InitPut(secondaryIndexEntry.Key, &secondaryIndexEntry.Value)

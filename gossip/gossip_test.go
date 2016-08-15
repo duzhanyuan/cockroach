@@ -18,10 +18,11 @@ package gossip
 
 import (
 	"bytes"
-	"errors"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/metric"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
@@ -39,8 +41,8 @@ func TestGossipInfoStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
-	rpcContext := rpc.NewContext(nil, nil, stopper)
-	g := New(rpcContext, nil, stopper)
+	rpcContext := rpc.NewContext(&base.Context{Insecure: true}, nil, stopper)
+	g := New(rpcContext, rpc.NewServer(rpcContext), nil, stopper, metric.NewRegistry())
 	// Have to call g.SetNodeID before call g.AddInfo
 	g.SetNodeID(roachpb.NodeID(1))
 	slice := []byte("b")
@@ -57,6 +59,8 @@ func TestGossipInfoStore(t *testing.T) {
 
 func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
 
 	resolverSpecs := []string{
 		"127.0.0.1:9000",
@@ -74,7 +78,8 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	if len(resolvers) != 3 {
 		t.Errorf("expected 3 resolvers; got %d", len(resolvers))
 	}
-	g := New(nil, resolvers, nil)
+	server := rpc.NewServer(rpc.NewContext(&base.Context{Insecure: true}, nil, stopper))
+	g := New(nil, server, resolvers, nil, metric.NewRegistry())
 
 	// Using specified resolvers, fetch bootstrap addresses 3 times
 	// and verify the results match expected addresses.
@@ -92,12 +97,58 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	}
 }
 
+func TestGossipRaceLogStatus(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+	local := startGossip(1, stopper, t, metric.NewRegistry())
+
+	local.mu.Lock()
+	peer := startGossip(2, stopper, t, metric.NewRegistry())
+	local.startClient(&peer.is.NodeAddr)
+	local.mu.Unlock()
+
+	// Race gossiping against LogStatus.
+	gun := make(chan struct{})
+	for i := uint8(0); i < 10; i++ {
+		go func() {
+			<-gun
+			local.LogStatus()
+		}()
+		gun <- struct{}{}
+		if err := local.AddInfo(
+			strconv.FormatUint(uint64(i), 10),
+			[]byte{i},
+			time.Hour,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(gun)
+}
+
+// TestGossipNoForwardSelf verifies that when a Gossip instance is full, it
+// redirects clients elsewhere (in particular not to itself).
+//
+// NB: Stress testing this test really stresses the OS networking stack
+// more than anything else. For example, on Linux it may quickly deplete
+// the ephemeral port range (due to the TIME_WAIT state).
+// On a box which only runs tests, this can be circumvented by running
+//
+//	sudo bash -c "echo 1 > /proc/sys/net/ipv4/tcp_tw_recycle"
+//
+// See https://vincent.bernat.im/en/blog/2014-tcp-time-wait-state-linux.html
+// for details.
+//
+// On OSX, things similarly fall apart. See #7524 and #5218 for some discussion
+// of this.
 func TestGossipNoForwardSelf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
-	local := startGossip(1, stopper, t)
+	local := startGossip(1, stopper, t, metric.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -106,11 +157,11 @@ func TestGossipNoForwardSelf(t *testing.T) {
 	// incoming clients.
 	peers := []*Gossip{local}
 	for i := 0; i < local.server.incoming.maxSize; i++ {
-		peers = append(peers, startGossip(roachpb.NodeID(i+2), stopper, t))
+		peers = append(peers, startGossip(roachpb.NodeID(i+2), stopper, t, metric.NewRegistry()))
 	}
 
 	for _, peer := range peers {
-		c := newClient(&local.is.NodeAddr)
+		c := newClient(&local.is.NodeAddr, makeMetrics())
 
 		util.SucceedsSoon(t, func() error {
 			conn, err := peer.rpcContext.GRPCDial(c.addr.String(), grpc.WithBlock())
@@ -139,10 +190,10 @@ func TestGossipNoForwardSelf(t *testing.T) {
 	// Start a few overflow peers and assert that they don't get forwarded to us
 	// again.
 	for i := 0; i < numClients; i++ {
-		peer := startGossip(roachpb.NodeID(i+local.server.incoming.maxSize+2), stopper, t)
+		peer := startGossip(roachpb.NodeID(i+local.server.incoming.maxSize+2), stopper, t, metric.NewRegistry())
 
 		for {
-			c := newClient(&local.is.NodeAddr)
+			c := newClient(&local.is.NodeAddr, makeMetrics())
 			c.start(peer, disconnectedCh, peer.rpcContext, stopper)
 
 			disconnectedClient := <-disconnectedCh
@@ -168,30 +219,36 @@ func TestGossipCullNetwork(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
-	local := startGossip(1, stopper, t)
+	local := startGossip(1, stopper, t, metric.NewRegistry())
 	local.SetCullInterval(5 * time.Millisecond)
 
 	local.mu.Lock()
 	for i := 0; i < minPeers; i++ {
-		peer := startGossip(roachpb.NodeID(i+2), stopper, t)
-		local.startClient(&peer.is.NodeAddr, stopper)
+		peer := startGossip(roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
+		local.startClient(&peer.is.NodeAddr)
 	}
 	local.mu.Unlock()
 
-	util.SucceedsSoon(t, func() error {
-		if len(local.Outgoing()) == minPeers {
-			return nil
+	const slowGossipDuration = time.Minute
+
+	if err := util.RetryForDuration(slowGossipDuration, func() error {
+		if peers := len(local.Outgoing()); peers != minPeers {
+			return errors.Errorf("%d of %d peers connected", peers, minPeers)
 		}
-		return errors.New("some peers not yet connected")
-	})
+		return nil
+	}); err != nil {
+		t.Fatalf("condition failed to evaluate within %s: %s", slowGossipDuration, err)
+	}
 
 	local.manage()
 
-	util.SucceedsSoon(t, func() error {
+	if err := util.RetryForDuration(slowGossipDuration, func() error {
 		// Verify that a client is closed within the cull interval.
-		if len(local.Outgoing()) == minPeers-1 {
-			return nil
+		if peers := len(local.Outgoing()); peers != minPeers-1 {
+			return errors.Errorf("%d of %d peers connected", peers, minPeers-1)
 		}
-		return errors.New("no network culling occurred")
-	})
+		return nil
+	}); err != nil {
+		t.Fatalf("condition failed to evaluate within %s: %s", slowGossipDuration, err)
+	}
 }

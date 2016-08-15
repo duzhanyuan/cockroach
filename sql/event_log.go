@@ -21,11 +21,11 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
-	"github.com/cockroachdb/cockroach/sql/privilege"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/pkg/errors"
 )
 
@@ -41,6 +41,20 @@ const (
 	EventLogCreateTable EventLogType = "create_table"
 	// EventLogDropTable is recorded when a table is dropped.
 	EventLogDropTable EventLogType = "drop_table"
+
+	// EventLogAlterTable is recorded when a table is altered.
+	EventLogAlterTable EventLogType = "alter_table"
+	// EventLogCreateIndex is recorded when an index is created.
+	EventLogCreateIndex EventLogType = "create_index"
+	// EventLogDropIndex is recorded when an index is created.
+	EventLogDropIndex EventLogType = "drop_index"
+	// EventLogReverseSchemaChange is recorded when an in-progress schema change
+	// encounters a problem and is reversed.
+	EventLogReverseSchemaChange EventLogType = "reverse_schema_change"
+	// EventLogFinishSchemaChange is recorded when a previously initiated schema
+	// change has completed.
+	EventLogFinishSchemaChange EventLogType = "finish_schema_change"
+
 	// EventLogNodeJoin is recorded when a node joins the cluster.
 	EventLogNodeJoin EventLogType = "node_join"
 	// EventLogNodeRestart is recorded when an existing node rejoins the cluster
@@ -63,7 +77,13 @@ CREATE TABLE system.eventlog (
 // AddEventLogToMetadataSchema adds the event log table to the supplied
 // MetadataSchema.
 func AddEventLogToMetadataSchema(schema *sqlbase.MetadataSchema) {
-	schema.AddTable(keys.EventLogTableID, eventTableSchema, privilege.List{privilege.ALL})
+	desc := CreateTableDescriptor(
+		keys.EventLogTableID,
+		keys.SystemDatabaseID,
+		eventTableSchema,
+		sqlbase.NewDefaultPrivilegeDescriptor(),
+	)
+	schema.AddDescriptor(keys.SystemDatabaseID, &desc)
 }
 
 // An EventLogger exposes methods used to record events to the event table.
@@ -82,6 +102,12 @@ func MakeEventLogger(leaseMgr *LeaseManager) EventLogger {
 // InsertEventRecord inserts a single event into the event log as part of the
 // provided transaction.
 func (ev EventLogger) InsertEventRecord(txn *client.Txn, eventType EventLogType, targetID, reportingID int32, info interface{}) error {
+	// Record event record insertion in local log output.
+	log.Infof(txn.Context, "Event: %q, target: %d, info: %+v",
+		eventType,
+		targetID,
+		info)
+
 	const insertEventTableStmt = `
 INSERT INTO system.eventlog (
   timestamp, eventType, targetID, reportingID, info

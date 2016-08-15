@@ -20,7 +20,7 @@ package sql
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
@@ -40,7 +40,10 @@ func convertBatchError(tableDesc *sqlbase.TableDescriptor, b *client.Batch) erro
 	var alloc sqlbase.DatumAlloc
 	if _, ok := origPErr.GetDetail().(*roachpb.ConditionFailedError); ok {
 		for _, row := range result.Rows {
-			indexID, key, err := sqlbase.DecodeIndexKeyPrefix(tableDesc, row.Key)
+			// TODO(dan): There's too much internal knowledge of the sql table
+			// encoding here (and this callsite is the only reason
+			// DecodeIndexKeyPrefix is exported). Refactor this bit out.
+			indexID, key, err := sqlbase.DecodeIndexKeyPrefix(&alloc, tableDesc, row.Key)
 			if err != nil {
 				return err
 			}

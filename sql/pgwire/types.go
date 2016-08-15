@@ -27,6 +27,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/sql/parser"
@@ -120,7 +122,7 @@ const secondsInDay = 24 * 60 * 60
 
 func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) {
 	if log.V(2) {
-		log.Infof("pgwire writing TEXT datum of type: %T, %#v", d, d)
+		log.Infof(context.TODO(), "pgwire writing TEXT datum of type: %T, %#v", d, d)
 	}
 	if d == parser.DNull {
 		// NULL is encoded as -1; all other values have a length prefix.
@@ -138,7 +140,6 @@ func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) 
 
 	case *parser.DInt:
 		// Start at offset 4 because `putInt32` clobbers the first 4 bytes.
-		// TODO(tamird): @petermattis sez this allocates. Investigate.
 		s := strconv.AppendInt(b.putbuf[4:4], int64(*v), 10)
 		b.putInt32(int32(len(s)))
 		b.write(s)
@@ -192,7 +193,7 @@ func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) 
 
 func (b *writeBuffer) writeBinaryDatum(d parser.Datum) {
 	if log.V(2) {
-		log.Infof("pgwire writing BINARY datum of type: %T, %#v", d, d)
+		log.Infof(context.TODO(), "pgwire writing BINARY datum of type: %T, %#v", d, d)
 	}
 	if d == parser.DNull {
 		// NULL is encoded as -1; all other values have a length prefix.
@@ -278,7 +279,7 @@ func (b *writeBuffer) writeBinaryDatum(d parser.Datum) {
 				digit *= 10
 				digit += int16(decDigit - '0')
 			}
-			b.putInt16(int16(digit))
+			b.putInt16(digit)
 			decDigits = decDigits[pgDecDigits:]
 		}
 
@@ -373,20 +374,21 @@ var (
 		oid.T_numeric:     parser.TypeDecimal,
 		oid.T_text:        parser.TypeString,
 		oid.T_timestamp:   parser.TypeTimestamp,
-		oid.T_timestamptz: parser.TypeTimestamp,
+		oid.T_timestamptz: parser.TypeTimestampTZ,
 		oid.T_varchar:     parser.TypeString,
 	}
 	// Using reflection to support unhashable types.
 	datumToOid = map[reflect.Type]oid.Oid{
-		reflect.TypeOf(parser.TypeBool):      oid.T_bool,
-		reflect.TypeOf(parser.TypeBytes):     oid.T_bytea,
-		reflect.TypeOf(parser.TypeDate):      oid.T_date,
-		reflect.TypeOf(parser.TypeFloat):     oid.T_float8,
-		reflect.TypeOf(parser.TypeInt):       oid.T_int8,
-		reflect.TypeOf(parser.TypeInterval):  oid.T_interval,
-		reflect.TypeOf(parser.TypeDecimal):   oid.T_numeric,
-		reflect.TypeOf(parser.TypeString):    oid.T_text,
-		reflect.TypeOf(parser.TypeTimestamp): oid.T_timestamptz,
+		reflect.TypeOf(parser.TypeBool):        oid.T_bool,
+		reflect.TypeOf(parser.TypeBytes):       oid.T_bytea,
+		reflect.TypeOf(parser.TypeDate):        oid.T_date,
+		reflect.TypeOf(parser.TypeFloat):       oid.T_float8,
+		reflect.TypeOf(parser.TypeInt):         oid.T_int8,
+		reflect.TypeOf(parser.TypeInterval):    oid.T_interval,
+		reflect.TypeOf(parser.TypeDecimal):     oid.T_numeric,
+		reflect.TypeOf(parser.TypeString):      oid.T_text,
+		reflect.TypeOf(parser.TypeTimestamp):   oid.T_timestamp,
+		reflect.TypeOf(parser.TypeTimestampTZ): oid.T_timestamptz,
 	}
 )
 
@@ -599,7 +601,7 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 		default:
 			return d, errors.Errorf("unsupported bytea format code: %s", code)
 		}
-	case oid.T_timestamp, oid.T_timestamptz:
+	case oid.T_timestamp:
 		switch code {
 		case formatText:
 			ts, err := parseTs(string(b))
@@ -610,12 +612,27 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 		default:
 			return d, errors.Errorf("unsupported timestamp format code: %s", code)
 		}
+	case oid.T_timestamptz:
+		switch code {
+		case formatText:
+			ts, err := parseTs(string(b))
+			if err != nil {
+				return d, errors.Errorf("could not parse string %q as timestamp", b)
+			}
+			d = parser.MakeDTimestampTZ(ts, time.Microsecond)
+		default:
+			return d, errors.Errorf("unsupported timestamptz format code: %s", code)
+		}
 	case oid.T_date:
 		switch code {
 		case formatText:
 			ts, err := parseTs(string(b))
 			if err != nil {
-				return d, errors.Errorf("could not parse string %q as date", b)
+				if res, err := parser.ParseDDate(string(b), time.UTC); err == nil {
+					d = res
+				} else {
+					return d, errors.Errorf("could not parse string %q as date", b)
+				}
 			}
 			daysSinceEpoch := ts.Unix() / secondsInDay
 			d = parser.NewDDate(parser.DDate(daysSinceEpoch))

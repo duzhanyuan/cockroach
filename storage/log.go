@@ -21,9 +21,10 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/pkg/errors"
 )
 
@@ -72,6 +73,16 @@ type rangeLogEvent struct {
 }
 
 func (s *Store) insertRangeLogEvent(txn *client.Txn, event rangeLogEvent) error {
+	// Record range log event to console log.
+	var info string
+	if event.info != nil {
+		info = *event.info
+	}
+	log.Infof(txn.Context, "Range Event: %q, range: %d, info: %s",
+		event.eventType,
+		event.rangeID,
+		info)
+
 	const insertEventTableStmt = `
 INSERT INTO system.rangelog (
   timestamp, rangeID, storeID, eventType, otherRangeID, info
@@ -100,11 +111,11 @@ VALUES(
 	// range log.
 	switch event.eventType {
 	case RangeEventLogSplit:
-		s.metrics.rangeSplits.Inc(1)
+		s.metrics.RangeSplits.Inc(1)
 	case RangeEventLogAdd:
-		s.metrics.rangeAdds.Inc(1)
+		s.metrics.RangeAdds.Inc(1)
 	case RangeEventLogRemove:
-		s.metrics.rangeRemoves.Inc(1)
+		s.metrics.RangeRemoves.Inc(1)
 	}
 
 	rows, err := s.ctx.SQLExecutor.ExecuteStatementInTransaction(txn, insertEventTableStmt, args...)

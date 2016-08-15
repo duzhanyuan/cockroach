@@ -29,6 +29,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/statistics.h"
+#include "rocksdb/sst_file_writer.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
@@ -38,6 +39,8 @@
 #include "db.h"
 #include "encoding.h"
 #include "eventlistener.h"
+
+#include <iostream>
 
 extern "C" {
 #include "_cgo_export.h"
@@ -63,6 +66,8 @@ struct DBEngine {
   virtual DBStatus Get(DBKey key, DBString* value) = 0;
   virtual DBIterator* NewIter(bool prefix) = 0;
   virtual DBStatus GetStats(DBStatsResult* stats) = 0;
+
+  DBSSTable* GetSSTables(int* n);
 };
 
 struct DBImpl : public DBEngine {
@@ -294,6 +299,16 @@ DBString ToDBString(const rocksdb::Slice& s) {
   result.data = static_cast<char*>(malloc(result.len));
   memcpy(result.data, s.data(), s.size());
   return result;
+}
+
+DBKey ToDBKey(const rocksdb::Slice& s) {
+  DBKey key;
+  memset(&key, 0, sizeof(key));
+  rocksdb::Slice tmp;
+  if (DecodeKey(s, &tmp, &key.wall_time, &key.logical)) {
+    key.key = ToDBSlice(tmp);
+  }
+  return key;
 }
 
 DBStatus ToDBStatus(const rocksdb::Status& status) {
@@ -621,10 +636,10 @@ bool MergeTimeSeriesValues(
 
 // ConsolidateTimeSeriesValue processes a single value which contains
 // InternalTimeSeriesData messages. This method will sort the sample collection
-// of the value, combining any samples with duplicate offsets. This method is
-// the single-value equivalent of MergeTimeSeriesValues, and is used in the case
-// where the first value is merged into the key. Returns true if the merge is
-// successful.
+// of the value, keeping only the last of samples with duplicate offsets.
+// This method is the single-value equivalent of MergeTimeSeriesValues, and is
+// used in the case where the first value is merged into the key. Returns true
+// if the merge is successful.
 bool ConsolidateTimeSeriesValue(std::string *val, rocksdb::Logger* logger) {
   // Attempt to parse TimeSeriesData from both Values.
   cockroach::roachpb::InternalTimeSeriesData val_ts;
@@ -644,19 +659,18 @@ bool ConsolidateTimeSeriesValue(std::string *val, rocksdb::Logger* logger) {
                    val_ts.mutable_samples()->pointer_end(),
                    TimeSeriesSampleOrdering);
 
-  // Merge sample values of left and right into new_ts.
+  // Consolidate sample values from the ts value with duplicate offsets.
   auto front = val_ts.samples().begin();
   auto end = val_ts.samples().end();
 
   // Loop until samples have been exhausted.
   while (front != end) {
-    // Create an empty sample in the output collection with the selected
-    // offset.  Accumulate data from all samples at the front of the sample
-    // collection which match the selected timestamp. This behavior is
-    // needed because even a single value may have duplicated offsets.
+    // Create an empty sample in the output collection.
     cockroach::roachpb::InternalTimeSeriesSample* ns = new_ts.add_samples();
     ns->set_offset(front->offset());
     while (front != end && front->offset() == ns->offset()) {
+      // Only the last sample in the value's repeated samples field with a given
+      // offset is kept in the case of multiple samples with identical offsets.
       ns->CopyFrom(*front);
       ++front;
     }
@@ -1312,6 +1326,35 @@ class BaseDeltaIterator : public rocksdb::Iterator {
 
 }  // namespace
 
+DBSSTable* DBEngine::GetSSTables(int* n) {
+  std::vector<rocksdb::LiveFileMetaData> metadata;
+  rep->GetLiveFilesMetaData(&metadata);
+  *n = metadata.size();
+  // We malloc the result so it can be deallocated by the caller using free().
+  const int size = metadata.size() * sizeof(DBSSTable);
+  DBSSTable *tables = reinterpret_cast<DBSSTable*>(malloc(size));
+  memset(tables, 0, size);
+  for (int i = 0; i < metadata.size(); i++) {
+    tables[i].level = metadata[i].level;
+    tables[i].size = metadata[i].size;
+
+    rocksdb::Slice tmp;
+    if (DecodeKey(metadata[i].smallestkey, &tmp,
+                  &tables[i].start_key.wall_time, &tables[i].start_key.logical)) {
+      // This is a bit ugly because we want DBKey.key to be copied and
+      // not refer to the memory in metadata[i].smallestkey.
+      DBString str = ToDBString(tmp);
+      tables[i].start_key.key = *reinterpret_cast<DBSlice*>(&str);
+    }
+    if (DecodeKey(metadata[i].largestkey, &tmp,
+                  &tables[i].end_key.wall_time, &tables[i].end_key.logical)) {
+      DBString str = ToDBString(tmp);
+      tables[i].end_key.key = *reinterpret_cast<DBSlice*>(&str);
+    }
+  }
+  return tables;
+}
+
 DBBatch::DBBatch(DBEngine* db)
     : DBEngine(db->rep),
       batch(&kComparator),
@@ -1353,15 +1396,16 @@ DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
   // increased read amplification.
   table_options.block_size = db_opts.block_size;
 
-  rocksdb::ColumnFamilyOptions cf_options;
-  cf_options.OptimizeLevelStyleCompaction(db_opts.memtable_budget);
-  // OptimizeLevelStyleCompaction sets no-compression for L0 and
-  // L1. Current benchmarks and tests show no benefit to doing this.
-  for (int i = 0; i < cf_options.compression_per_level.size(); i++) {
-    cf_options.compression_per_level[i] = rocksdb::kSnappyCompression;
-  }
-
-  rocksdb::Options options(rocksdb::DBOptions(), cf_options);
+  // Use the rocksdb options builder to configure the base options
+  // using our memtable budget.
+  rocksdb::Options options(rocksdb::GetOptions(db_opts.memtable_budget));
+  // Increase parallelism for compactions based on the number of
+  // cpus. This will use 1 high priority thread for flushes and
+  // num_cpu-1 low priority threads for compactions.
+  options.IncreaseParallelism(db_opts.num_cpu);
+  // Enable subcompactions which will use multiple threads to speed up
+  // a single compaction. The value of num_cpu/2 has not been tuned.
+  options.max_subcompactions = std::max(db_opts.num_cpu / 2, 1);
   options.allow_os_buffer = db_opts.allow_os_buffer;
   options.WAL_ttl_seconds = db_opts.wal_ttl_seconds;
   options.comparator = &kComparator;
@@ -1371,13 +1415,39 @@ DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
   options.prefix_extractor.reset(new DBPrefixExtractor);
   options.statistics = rocksdb::CreateDBStatistics();
   options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
+  options.max_open_files = db_opts.max_open_files;
 
-  // File size settings: TODO(marc): investigate and determine better long-term settings:
-  // https://github.com/cockroachdb/cockroach/issues/5852
-  options.target_file_size_base = 64 << 20;
-  options.target_file_size_multiplier = 8;
-  options.max_bytes_for_level_base = 512 << 20;
-  options.max_bytes_for_level_multiplier = 8;
+  // Merge two memtables when flushing to L0.
+  options.min_write_buffer_number_to_merge = 2;
+  // Enable dynamic level sizing which reduces both size and write
+  // amplification. This causes RocksDB to pick the target size of
+  // each level dynamically.
+  options.level_compaction_dynamic_level_bytes = true;
+  // Follow the RocksDB recommendation to configure the size of L1 to
+  // be the same as the estimated size of L0.
+  options.max_bytes_for_level_base = options.write_buffer_size *
+      options.min_write_buffer_number_to_merge * options.level0_file_num_compaction_trigger;
+  options.max_bytes_for_level_multiplier = 10;
+  // Target the base file size as 1/4 of the base size which will give
+  // us ~4 files in the base level (level 0). Each additional level
+  // grows the file size by 2. If max_bytes_for_level_base is 16 MB,
+  // this translates into the following target level and file sizes
+  // for each level:
+  //
+  //       level-size  file-size  max-files
+  //   L1:      16 MB       4 MB          4
+  //   L2:     160 MB       8 MB         20
+  //   L3:     1.6 GB      16 MB        100
+  //   L4:      16 GB      32 MB        500
+  //   L5:     156 GB      64 MB       2500
+  //   L6:     1.6 TB     128 MB      12500
+  //
+  // We don't want the target file size to be too large, otherwise
+  // individual compactions become more expensive. We don't want the
+  // target file size to be too small or else we get an overabundance
+  // of sstables.
+  options.target_file_size_base = options.max_bytes_for_level_base / 4;
+  options.target_file_size_multiplier = 2;
 
   // Register listener for tracking RocksDB stats.
   std::shared_ptr<DBEventListener> event_listener(new DBEventListener);
@@ -1898,4 +1968,60 @@ MVCCStatsResult MVCCComputeStats(
 // write them to the provided DBStatsResult instance.
 DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) {
   return db->GetStats(stats);
+}
+
+DBSSTable* DBGetSSTables(DBEngine* db, int* n) {
+  return db->GetSSTables(n);
+}
+
+DBStatus DBEngineAddFile(DBEngine* db, DBSlice path) {
+  rocksdb::Status status = db->rep->AddFile(ToString(path));
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  return kSuccess;
+}
+
+struct DBSstFileWriter {
+  std::unique_ptr<rocksdb::Options> options;
+  rocksdb::ImmutableCFOptions ioptions;
+  rocksdb::SstFileWriter rep;
+
+  DBSstFileWriter(rocksdb::Options* o)
+      : options(o),
+        ioptions(*o),
+        rep(rocksdb::EnvOptions(), ioptions, o->comparator) {
+  }
+  virtual ~DBSstFileWriter() { }
+};
+
+DBSstFileWriter* DBSstFileWriterNew() {
+  rocksdb::Options* options = new rocksdb::Options();
+  options->comparator = &kComparator;
+  return new DBSstFileWriter(options);
+}
+
+DBStatus DBSstFileWriterOpen(DBSstFileWriter* fw, DBSlice path) {
+  rocksdb::Status status = fw->rep.Open(ToString(path));
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  return kSuccess;
+}
+
+DBStatus DBSstFileWriterAdd(DBSstFileWriter* fw, DBKey key, DBSlice val) {
+  rocksdb::Status status = fw->rep.Add(EncodeKey(key), ToSlice(val));
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  return kSuccess;
+}
+
+DBStatus DBSstFileWriterClose(DBSstFileWriter* fw) {
+  rocksdb::Status status = fw->rep.Finish();
+  delete fw;
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  return kSuccess;
 }

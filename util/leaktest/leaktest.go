@@ -34,6 +34,9 @@ func interestingGoroutines() (gs []string) {
 
 		if stack == "" ||
 			strings.Contains(stack, "github.com/cockroachdb/cockroach/util/log.init") ||
+			// Go1.7 added a goroutine to network dialing that doesn't shut down
+			// quickly.
+			strings.Contains(stack, "created by net.(*netFD).connect") ||
 			// Below are the stacks ignored by the upstream leaktest code.
 			strings.Contains(stack, "testing.Main(") ||
 			strings.Contains(stack, "testing.tRunner(") ||
@@ -64,6 +67,9 @@ func AfterTest(t testing.TB) func() {
 	return func() {
 		if t.Failed() {
 			return
+		}
+		if r := recover(); r != nil {
+			panic(r)
 		}
 		// Loop, waiting for goroutines to shut down.
 		// Wait up to 5 seconds, but finish as quickly as possible.

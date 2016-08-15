@@ -79,13 +79,14 @@ func (l IndexElemList) Format(buf *bytes.Buffer, f FmtFlags) {
 // CreateIndex represents a CREATE INDEX statement.
 type CreateIndex struct {
 	Name        Name
-	Table       *QualifiedName
+	Table       NormalizableTableName
 	Unique      bool
 	IfNotExists bool
 	Columns     IndexElemList
 	// Extra columns to be stored together with the indexed ones as an optimization
 	// for improved reading performance.
-	Storing NameList
+	Storing    NameList
+	Interleave *InterleaveDef
 }
 
 // Format implements the NodeFormatter interface.
@@ -105,7 +106,12 @@ func (node *CreateIndex) Format(buf *bytes.Buffer, f FmtFlags) {
 	FormatNode(buf, f, node.Columns)
 	buf.WriteByte(')')
 	if node.Storing != nil {
-		fmt.Fprintf(buf, " STORING (%s)", node.Storing)
+		buf.WriteString(" STORING (")
+		FormatNode(buf, f, node.Storing)
+		buf.WriteByte(')')
+	}
+	if node.Interleave != nil {
+		FormatNode(buf, f, node.Interleave)
 	}
 }
 
@@ -168,11 +174,15 @@ type ColumnTableDef struct {
 		ConstraintName Name
 	}
 	References struct {
-		Table          *QualifiedName
+		Table          NormalizableTableName
 		Col            Name
 		ConstraintName Name
 	}
-	Family Name
+	Family struct {
+		Name        Name
+		Create      bool
+		IfNotExists bool
+	}
 }
 
 func newColumnTableDef(
@@ -222,7 +232,9 @@ func newColumnTableDef(
 				d.References.ConstraintName = c.Name
 			}
 		case *ColumnFamilyConstraint:
-			d.Family = t.Family
+			d.Family.Name = t.Family
+			d.Family.Create = t.Create
+			d.Family.IfNotExists = t.IfNotExists
 		default:
 			panic(fmt.Sprintf("unexpected column qualification: %T", c))
 		}
@@ -267,7 +279,7 @@ func (node *ColumnTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 		FormatNode(buf, f, node.CheckExpr.Expr)
 		buf.WriteByte(')')
 	}
-	if node.References.Table != nil {
+	if node.References.Table.TableNameReference != nil {
 		if node.References.ConstraintName != "" {
 			fmt.Fprintf(buf, " CONSTRAINT %s", node.References.ConstraintName)
 		}
@@ -279,9 +291,18 @@ func (node *ColumnTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 			buf.WriteByte(')')
 		}
 	}
-	if node.Family != "" {
-		buf.WriteString(" FAMILY ")
-		FormatNode(buf, f, node.Family)
+	if node.Family.Name != "" || node.Family.Create {
+		if node.Family.Create {
+			buf.WriteString(" CREATE")
+		}
+		if node.Family.IfNotExists {
+			buf.WriteString(" IF NOT EXISTS")
+		}
+		buf.WriteString(" FAMILY")
+		if len(node.Family.Name) > 0 {
+			buf.WriteByte(' ')
+			FormatNode(buf, f, node.Family.Name)
+		}
 	}
 }
 
@@ -329,13 +350,15 @@ type ColumnCheckConstraint struct {
 
 // ColumnFKConstraint represents a FK-constaint on a column.
 type ColumnFKConstraint struct {
-	Table *QualifiedName
+	Table NormalizableTableName
 	Col   Name // empty-string means use PK
 }
 
 // ColumnFamilyConstraint represents FAMILY on a column.
 type ColumnFamilyConstraint struct {
-	Family Name
+	Family      Name
+	Create      bool
+	IfNotExists bool
 }
 
 // NameListToIndexElems converts a NameList to an IndexElemList with all
@@ -343,7 +366,7 @@ type ColumnFamilyConstraint struct {
 func NameListToIndexElems(lst NameList) IndexElemList {
 	elems := make(IndexElemList, 0, len(lst))
 	for _, n := range lst {
-		elems = append(elems, IndexElem{Column: Name(n), Direction: DefaultDirection})
+		elems = append(elems, IndexElem{Column: n, Direction: DefaultDirection})
 	}
 	return elems
 }
@@ -351,9 +374,10 @@ func NameListToIndexElems(lst NameList) IndexElemList {
 // IndexTableDef represents an index definition within a CREATE TABLE
 // statement.
 type IndexTableDef struct {
-	Name    Name
-	Columns IndexElemList
-	Storing NameList
+	Name       Name
+	Columns    IndexElemList
+	Storing    NameList
+	Interleave *InterleaveDef
 }
 
 func (node *IndexTableDef) setName(name Name) {
@@ -374,6 +398,9 @@ func (node *IndexTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 		buf.WriteString(" STORING (")
 		FormatNode(buf, f, node.Storing)
 		buf.WriteByte(')')
+	}
+	if node.Interleave != nil {
+		FormatNode(buf, f, node.Interleave)
 	}
 }
 
@@ -413,7 +440,43 @@ func (node *UniqueConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 		FormatNode(buf, f, node.Storing)
 		buf.WriteByte(')')
 	}
+	if node.Interleave != nil {
+		FormatNode(buf, f, node.Interleave)
+	}
 }
+
+// ForeignKeyConstraintTableDef represents a FOREIGN KEY constraint in the AST.
+type ForeignKeyConstraintTableDef struct {
+	Name     Name
+	Table    NormalizableTableName
+	FromCols NameList
+	ToCols   NameList
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ForeignKeyConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
+	if node.Name != "" {
+		fmt.Fprintf(buf, "CONSTRAINT %s ", node.Name)
+	}
+	buf.WriteString("FOREIGN KEY (")
+	FormatNode(buf, f, node.FromCols)
+	buf.WriteString(") REFERENCES ")
+	FormatNode(buf, f, node.Table)
+
+	if len(node.ToCols) > 0 {
+		buf.WriteByte(' ')
+		buf.WriteByte('(')
+		FormatNode(buf, f, node.ToCols)
+		buf.WriteByte(')')
+	}
+}
+
+func (node *ForeignKeyConstraintTableDef) setName(name Name) {
+	node.Name = name
+}
+
+func (*ForeignKeyConstraintTableDef) tableDef()           {}
+func (*ForeignKeyConstraintTableDef) constraintTableDef() {}
 
 func (*CheckConstraintTableDef) tableDef()           {}
 func (*CheckConstraintTableDef) constraintTableDef() {}
@@ -439,35 +502,11 @@ func (node *CheckConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteByte(')')
 }
 
-// FamilyElem represents a column in a FAMILY constraint.
-type FamilyElem struct {
-	Column Name
-}
-
-// Format implements the NodeFormatter interface.
-func (node FamilyElem) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Column)
-}
-
-// FamilyElemList is list of FamilyElem.
-type FamilyElemList []FamilyElem
-
-// Format pretty-prints the contained names separated by commas.
-// Format implements the NodeFormatter interface.
-func (l FamilyElemList) Format(buf *bytes.Buffer, f FmtFlags) {
-	for i, FamilyElem := range l {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		FormatNode(buf, f, FamilyElem)
-	}
-}
-
 // FamilyTableDef represents a family definition within a CREATE TABLE
 // statement.
 type FamilyTableDef struct {
 	Name    Name
-	Columns FamilyElemList
+	Columns NameList
 }
 
 func (node *FamilyTableDef) setName(name Name) {
@@ -486,10 +525,37 @@ func (node *FamilyTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteByte(')')
 }
 
+// InterleaveDef represents an interleave definition within a CREATE TABLE
+// or CREATE INDEX statement.
+type InterleaveDef struct {
+	Parent       NormalizableTableName
+	Fields       NameList
+	DropBehavior DropBehavior
+}
+
+// Format implements the NodeFormatter interface.
+func (node *InterleaveDef) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString(" INTERLEAVE IN PARENT ")
+	FormatNode(buf, f, node.Parent)
+	buf.WriteString(" (")
+	for i, field := range node.Fields {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		FormatNode(buf, f, field)
+	}
+	buf.WriteString(")")
+	if node.DropBehavior != DropDefault {
+		buf.WriteString(" ")
+		buf.WriteString(node.DropBehavior.String())
+	}
+}
+
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
 	IfNotExists bool
-	Table       *QualifiedName
+	Table       NormalizableTableName
+	Interleave  *InterleaveDef
 	Defs        TableDefs
 }
 
@@ -503,4 +569,7 @@ func (node *CreateTable) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(" (")
 	FormatNode(buf, f, node.Defs)
 	buf.WriteByte(')')
+	if node.Interleave != nil {
+		FormatNode(buf, f, node.Interleave)
+	}
 }

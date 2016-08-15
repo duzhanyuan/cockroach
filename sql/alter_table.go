@@ -35,19 +35,12 @@ type alterTableNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) AlterTable(n *parser.AlterTable) (planNode, error) {
-	if err := n.Table.NormalizeTableName(p.session.Database); err != nil {
-		return nil, err
-	}
-
-	dbDesc, err := p.getDatabaseDesc(n.Table.Database())
+	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
 	}
-	if dbDesc == nil {
-		return nil, sqlbase.NewUndefinedDatabaseError(n.Table.Database())
-	}
 
-	tableDesc, err := p.getTableDesc(n.Table)
+	tableDesc, err := p.getTableDesc(tn)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +48,7 @@ func (p *planner) AlterTable(n *parser.AlterTable) (planNode, error) {
 		if n.IfExists {
 			return &emptyNode{}, nil
 		}
-		return nil, sqlbase.NewUndefinedTableError(n.Table.String())
+		return nil, sqlbase.NewUndefinedTableError(tn.String())
 	}
 
 	if err := p.checkPrivilege(tableDesc, privilege.CREATE); err != nil {
@@ -83,19 +76,27 @@ func (n *alterTableNode) Start() error {
 			if err != nil {
 				return err
 			}
-			status, i, err := n.tableDesc.FindColumnByName(col.Name)
+			normName := sqlbase.ReNormalizeName(col.Name)
+			status, i, err := n.tableDesc.FindColumnByNormalizedName(normName)
 			if err == nil {
 				if status == sqlbase.DescriptorIncomplete &&
 					n.tableDesc.Mutations[i].Direction == sqlbase.DescriptorMutation_DROP {
 					return fmt.Errorf("column %q being dropped, try again later", col.Name)
 				}
+				if status == sqlbase.DescriptorActive && t.IfNotExists {
+					continue
+				}
 			}
+
 			n.tableDesc.AddColumnMutation(*col, sqlbase.DescriptorMutation_ADD)
 			if idx != nil {
 				n.tableDesc.AddIndexMutation(*idx, sqlbase.DescriptorMutation_ADD)
 			}
-			if t.ColumnDef.Family != "" {
-				if err := n.tableDesc.AddColumnToFamily(col.Name, string(t.ColumnDef.Family)); err != nil {
+			if t.ColumnDef.Family.Create || len(t.ColumnDef.Family.Name) > 0 {
+				err := n.tableDesc.AddColumnToFamilyMaybeCreate(
+					col.Name, string(t.ColumnDef.Family.Name), t.ColumnDef.Family.Create,
+					t.ColumnDef.Family.IfNotExists)
+				if err != nil {
 					return err
 				}
 			}
@@ -106,20 +107,19 @@ func (n *alterTableNode) Start() error {
 				if d.PrimaryKey {
 					return fmt.Errorf("multiple primary keys for table %q are not allowed", n.tableDesc.Name)
 				}
-				name := string(d.Name)
 				idx := sqlbase.IndexDescriptor{
-					Name:             name,
+					Name:             string(d.Name),
 					Unique:           true,
-					StoreColumnNames: d.Storing,
+					StoreColumnNames: d.Storing.ToStrings(),
 				}
 				if err := idx.FillColumns(d.Columns); err != nil {
 					return err
 				}
-				status, i, err := n.tableDesc.FindIndexByName(name)
+				status, i, err := n.tableDesc.FindIndexByName(d.Name)
 				if err == nil {
 					if status == sqlbase.DescriptorIncomplete &&
 						n.tableDesc.Mutations[i].Direction == sqlbase.DescriptorMutation_DROP {
-						return fmt.Errorf("index %q being dropped, try again later", name)
+						return fmt.Errorf("index %q being dropped, try again later", d.Name)
 					}
 				}
 				n.tableDesc.AddIndexMutation(idx, sqlbase.DescriptorMutation_ADD)
@@ -242,6 +242,24 @@ func (n *alterTableNode) Start() error {
 	if err := n.p.writeTableDesc(n.tableDesc); err != nil {
 		return err
 	}
+
+	// Record this table alteration in the event log. This is an auditable log
+	// event and is recorded in the same transaction as the table descriptor
+	// update.
+	if err := MakeEventLogger(n.p.leaseMgr).InsertEventRecord(n.p.txn,
+		EventLogAlterTable,
+		int32(n.tableDesc.ID),
+		int32(n.p.evalCtx.NodeID),
+		struct {
+			TableName  string
+			Statement  string
+			User       string
+			MutationID uint32
+		}{n.tableDesc.Name, n.n.String(), n.p.session.User, uint32(mutationID)},
+	); err != nil {
+		return err
+	}
+
 	n.p.notifySchemaChange(n.tableDesc.ID, mutationID)
 
 	return nil

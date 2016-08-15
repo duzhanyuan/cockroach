@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/util/encoding"
@@ -50,8 +52,8 @@ var traceColumns = append([]ResultColumn{
 }, debugColumns...)
 
 var traceOrdering = sqlbase.ColumnOrdering{
-	{len(traceColumns), encoding.Ascending}, /* Start time */
-	{2, encoding.Ascending},                 /* Span pos */
+	{ColIdx: len(traceColumns), Direction: encoding.Ascending}, /* Start time */
+	{ColIdx: 2, Direction: encoding.Ascending},                 /* Span pos */
 }
 
 func makeTraceNode(plan planNode, txn *client.Txn) planNode {
@@ -61,6 +63,10 @@ func makeTraceNode(plan planNode, txn *client.Txn) planNode {
 			txn:  txn,
 		},
 		sort: &sortNode{
+			// Don't use the planner context: this sort node is sorting the
+			// trace events themselves; we don't want any events from this sort
+			// node to show up in the EXPLAIN TRACE output.
+			ctx:      context.Background(),
 			ordering: traceOrdering,
 			columns:  traceColumns,
 		},
@@ -106,8 +112,7 @@ func (n *explainTraceNode) Next() (bool, error) {
 		if len(n.txn.CollectedSpans) == 0 {
 			if !n.exhausted {
 				n.txn.CollectedSpans = append(n.txn.CollectedSpans, basictracer.RawSpan{
-					Context: basictracer.Context{},
-					Logs:    []opentracing.LogData{{Timestamp: n.lastTS}},
+					Logs: []opentracing.LogData{{Timestamp: n.lastTS}},
 				})
 			}
 			basePos = n.lastPos + 1
@@ -125,10 +130,10 @@ func (n *explainTraceNode) Next() (bool, error) {
 
 		for _, sp := range n.txn.CollectedSpans {
 			for i, entry := range sp.Logs {
-				commulativeDuration := fmt.Sprintf("%.3fms", time.Duration(entry.Timestamp.Sub(n.earliest)).Seconds()*1000)
+				commulativeDuration := fmt.Sprintf("%.3fms", entry.Timestamp.Sub(n.earliest).Seconds()*1000)
 				var duration string
 				if i > 0 {
-					duration = fmt.Sprintf("%.3fms", time.Duration(entry.Timestamp.Sub(n.lastTS)).Seconds()*1000)
+					duration = fmt.Sprintf("%.3fms", entry.Timestamp.Sub(n.lastTS).Seconds()*1000)
 				}
 				cols := append(parser.DTuple{
 					parser.NewDString(commulativeDuration),

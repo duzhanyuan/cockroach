@@ -19,6 +19,8 @@ package parser
 import (
 	"bytes"
 	"fmt"
+
+	"github.com/pkg/errors"
 )
 
 // ColumnType represents a type in a column definition.
@@ -57,7 +59,7 @@ func (node *BoolColType) Format(buf *bytes.Buffer, f FmtFlags) {
 
 // Pre-allocated immutable integer column types.
 var (
-	intColTypeBit         = &IntColType{Name: "BIT"}
+	intColTypeBit         = &IntColType{Name: "BIT", N: 1, ImplicitWidth: true}
 	intColTypeInt         = &IntColType{Name: "INT"}
 	intColTypeInt64       = &IntColType{Name: "INT64"}
 	intColTypeInteger     = &IntColType{Name: "INTEGER"}
@@ -68,23 +70,26 @@ var (
 	intColTypeBigSerial   = &IntColType{Name: "BIGSERIAL"}
 )
 
-func newIntBitType(n int) *IntColType {
-	if n == 0 {
-		return intColTypeBit
+var errBitLengthNotPositive = errors.New("length for type bit must be at least 1")
+
+func newIntBitType(n int) (*IntColType, error) {
+	if n < 1 {
+		return nil, errBitLengthNotPositive
 	}
-	return &IntColType{Name: "BIT", N: n}
+	return &IntColType{Name: "BIT", N: n}, nil
 }
 
 // IntColType represents an INT, INTEGER, SMALLINT or BIGINT type.
 type IntColType struct {
-	Name string
-	N    int
+	Name          string
+	N             int
+	ImplicitWidth bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *IntColType) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(node.Name)
-	if node.N > 0 {
+	if node.N > 0 && !node.ImplicitWidth {
 		fmt.Fprintf(buf, "(%d)", node.N)
 	}
 }
@@ -247,3 +252,30 @@ func (node *TimestampTZColType) String() string { return AsString(node) }
 func (node *IntervalColType) String() string    { return AsString(node) }
 func (node *StringColType) String() string      { return AsString(node) }
 func (node *BytesColType) String() string       { return AsString(node) }
+
+// DatumTypeToColumnType produces a SQL column type equivalent to the
+// given Datum type. Used to generate CastExpr nodes during
+// normalization.
+func DatumTypeToColumnType(d Datum) (ColumnType, error) {
+	switch d.(type) {
+	case *DInt:
+		return intColTypeInt, nil
+	case *DFloat:
+		return floatColTypeFloat, nil
+	case *DDecimal:
+		return decimalColTypeDecimal, nil
+	case *DTimestamp:
+		return timestampColTypeTimestamp, nil
+	case *DTimestampTZ:
+		return timestampTzColTypeTimestampWithTZ, nil
+	case *DInterval:
+		return intervalColTypeInterval, nil
+	case *DDate:
+		return dateColTypeDate, nil
+	case *DString:
+		return stringColTypeString, nil
+	case *DBytes:
+		return bytesColTypeBytes, nil
+	}
+	return nil, errors.Errorf("internal error: unknown Datum type %T", d)
+}

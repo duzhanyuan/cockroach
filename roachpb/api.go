@@ -73,9 +73,9 @@ func (r RangeIDSlice) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
 func (r RangeIDSlice) Less(i, j int) bool { return r[i] < r[j] }
 
 const (
-	isAdmin    = 1 << iota // admin cmds don't go through raft, but run on leader
-	isRead                 // read-only cmds don't go through raft, but may run on leader
-	isWrite                // write cmds go through raft and must be proposed on leader
+	isAdmin    = 1 << iota // admin cmds don't go through raft, but run on lease holder
+	isRead                 // read-only cmds don't go through raft, but may run on lease holder
+	isWrite                // write cmds go through raft and must be proposed on lease holder
 	isTxn                  // txn commands may be part of a transaction
 	isTxnWrite             // txn write cmds start heartbeat and are marked for intent resolution
 	isRange                // range commands may span multiple keys
@@ -150,6 +150,11 @@ func (rh *ResponseHeader) combine(otherRH ResponseHeader) error {
 	if rh.Txn != nil && otherRH.Txn == nil {
 		rh.Txn = nil
 	}
+	if rh.ResumeSpan != nil {
+		panic(fmt.Sprintf("combining %+v with %+v", rh.ResumeSpan, otherRH.ResumeSpan))
+	}
+	rh.ResumeSpan = otherRH.ResumeSpan
+	rh.NumKeys += otherRH.NumKeys
 	return nil
 }
 
@@ -175,6 +180,7 @@ func (sr *ReverseScanResponse) combine(c combinable) error {
 		if err := sr.ResponseHeader.combine(otherSR.Header()); err != nil {
 			return err
 		}
+
 	}
 	return nil
 }
@@ -344,49 +350,6 @@ func (ru *ResponseUnion) MustSetInner(reply Response) {
 	}
 }
 
-// Bounded is implemented by request types which have a bounded number of
-// result rows, such as Scan.
-type Bounded interface {
-	GetBound() int64
-	SetBound(bound int64)
-}
-
-// GetBound returns the MaxResults field in ScanRequest.
-func (sr *ScanRequest) GetBound() int64 {
-	return sr.MaxResults
-}
-
-// SetBound sets the MaxResults field in ScanRequest.
-func (sr *ScanRequest) SetBound(bound int64) {
-	sr.MaxResults = bound
-}
-
-// GetBound returns the MaxResults field in ReverseScanRequest.
-func (rsr *ReverseScanRequest) GetBound() int64 {
-	return rsr.MaxResults
-}
-
-// SetBound sets the MaxResults field in ReverseScanRequest.
-func (rsr *ReverseScanRequest) SetBound(bound int64) {
-	rsr.MaxResults = bound
-}
-
-// Countable is implemented by response types which have a number of
-// result rows, such as Scan.
-type Countable interface {
-	Count() int64
-}
-
-// Count returns the number of rows in ScanResponse.
-func (sr *ScanResponse) Count() int64 {
-	return int64(len(sr.Rows))
-}
-
-// Count returns the number of rows in ReverseScanResponse.
-func (sr *ReverseScanResponse) Count() int64 {
-	return int64(len(sr.Rows))
-}
-
 // Method implements the Request interface.
 func (*GetRequest) Method() Method { return Get }
 
@@ -433,6 +396,9 @@ func (*AdminSplitRequest) Method() Method { return AdminSplit }
 func (*AdminMergeRequest) Method() Method { return AdminMerge }
 
 // Method implements the Request interface.
+func (*AdminTransferLeaseRequest) Method() Method { return AdminTransferLease }
+
+// Method implements the Request interface.
 func (*HeartbeatTxnRequest) Method() Method { return HeartbeatTxn }
 
 // Method implements the Request interface.
@@ -460,7 +426,10 @@ func (*MergeRequest) Method() Method { return Merge }
 func (*TruncateLogRequest) Method() Method { return TruncateLog }
 
 // Method implements the Request interface.
-func (*LeaderLeaseRequest) Method() Method { return LeaderLease }
+func (*RequestLeaseRequest) Method() Method { return RequestLease }
+
+// Method implements the Request interface.
+func (*TransferLeaseRequest) Method() Method { return TransferLease }
 
 // Method implements the Request interface.
 func (*ComputeChecksumRequest) Method() Method { return ComputeChecksum }
@@ -559,6 +528,12 @@ func (amr *AdminMergeRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
+func (atlr *AdminTransferLeaseRequest) ShallowCopy() Request {
+	shallowCopy := *atlr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
 func (htr *HeartbeatTxnRequest) ShallowCopy() Request {
 	shallowCopy := *htr
 	return &shallowCopy
@@ -613,8 +588,14 @@ func (tlr *TruncateLogRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
-func (llr *LeaderLeaseRequest) ShallowCopy() Request {
+func (llr *RequestLeaseRequest) ShallowCopy() Request {
 	shallowCopy := *llr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (lt *TransferLeaseRequest) ShallowCopy() Request {
+	shallowCopy := *lt
 	return &shallowCopy
 }
 
@@ -645,6 +626,7 @@ func (*BeginTransactionRequest) createReply() Response   { return &BeginTransact
 func (*EndTransactionRequest) createReply() Response     { return &EndTransactionResponse{} }
 func (*AdminSplitRequest) createReply() Response         { return &AdminSplitResponse{} }
 func (*AdminMergeRequest) createReply() Response         { return &AdminMergeResponse{} }
+func (*AdminTransferLeaseRequest) createReply() Response { return &AdminTransferLeaseResponse{} }
 func (*HeartbeatTxnRequest) createReply() Response       { return &HeartbeatTxnResponse{} }
 func (*GCRequest) createReply() Response                 { return &GCResponse{} }
 func (*PushTxnRequest) createReply() Response            { return &PushTxnResponse{} }
@@ -654,7 +636,8 @@ func (*ResolveIntentRangeRequest) createReply() Response { return &ResolveIntent
 func (*NoopRequest) createReply() Response               { return &NoopResponse{} }
 func (*MergeRequest) createReply() Response              { return &MergeResponse{} }
 func (*TruncateLogRequest) createReply() Response        { return &TruncateLogResponse{} }
-func (*LeaderLeaseRequest) createReply() Response        { return &LeaderLeaseResponse{} }
+func (*RequestLeaseRequest) createReply() Response       { return &RequestLeaseResponse{} }
+func (*TransferLeaseRequest) createReply() Response      { return &RequestLeaseResponse{} }
 func (*ComputeChecksumRequest) createReply() Response    { return &ComputeChecksumResponse{} }
 func (*VerifyChecksumRequest) createReply() Response     { return &VerifyChecksumResponse{} }
 
@@ -758,13 +741,12 @@ func NewDeleteRange(startKey, endKey Key, returnKeys bool) Request {
 
 // NewScan returns a Request initialized to scan from start to end keys
 // with max results.
-func NewScan(key, endKey Key, maxResults int64) Request {
+func NewScan(key, endKey Key) Request {
 	return &ScanRequest{
 		Span: Span{
 			Key:    key,
 			EndKey: endKey,
 		},
-		MaxResults: maxResults,
 	}
 }
 
@@ -793,13 +775,12 @@ func NewCheckConsistency(key, endKey Key, withDiff bool) Request {
 
 // NewReverseScan returns a Request initialized to reverse scan from end to
 // start keys with max results.
-func NewReverseScan(key, endKey Key, maxResults int64) Request {
+func NewReverseScan(key, endKey Key) Request {
 	return &ReverseScanRequest{
 		Span: Span{
 			Key:    key,
 			EndKey: endKey,
 		},
-		MaxResults: maxResults,
 	}
 }
 
@@ -816,6 +797,7 @@ func (*BeginTransactionRequest) flags() int   { return isWrite | isTxn }
 func (*EndTransactionRequest) flags() int     { return isWrite | isTxn | isAlone }
 func (*AdminSplitRequest) flags() int         { return isAdmin | isAlone }
 func (*AdminMergeRequest) flags() int         { return isAdmin | isAlone }
+func (*AdminTransferLeaseRequest) flags() int { return isAdmin | isAlone }
 func (*HeartbeatTxnRequest) flags() int       { return isWrite | isTxn }
 func (*GCRequest) flags() int                 { return isWrite | isRange }
 func (*PushTxnRequest) flags() int            { return isWrite }
@@ -825,8 +807,12 @@ func (*ResolveIntentRangeRequest) flags() int { return isWrite | isRange }
 func (*NoopRequest) flags() int               { return isRead } // slightly special
 func (*MergeRequest) flags() int              { return isWrite }
 func (*TruncateLogRequest) flags() int        { return isWrite }
-func (*LeaderLeaseRequest) flags() int        { return isWrite }
-func (*ComputeChecksumRequest) flags() int    { return isWrite }
-func (*VerifyChecksumRequest) flags() int     { return isWrite }
-func (*CheckConsistencyRequest) flags() int   { return isAdmin | isRange }
-func (*ChangeFrozenRequest) flags() int       { return isWrite | isRange }
+
+// TODO(tschottdorf): consider setting isAlone on RequestLeaseRequest and
+// LeaseTransferRequest.
+func (*RequestLeaseRequest) flags() int     { return isWrite }
+func (*TransferLeaseRequest) flags() int    { return isWrite }
+func (*ComputeChecksumRequest) flags() int  { return isWrite }
+func (*VerifyChecksumRequest) flags() int   { return isWrite }
+func (*CheckConsistencyRequest) flags() int { return isAdmin | isRange }
+func (*ChangeFrozenRequest) flags() int     { return isWrite | isRange }

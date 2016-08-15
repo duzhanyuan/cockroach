@@ -22,12 +22,16 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/storage"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	_ "github.com/cockroachdb/pq"
@@ -35,17 +39,8 @@ import (
 
 func TestLogSplits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
-
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestLogSplits")
-	defer cleanupFn()
-
-	db, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	countSplits := func() int {
 		var count int
@@ -65,7 +60,6 @@ func TestLogSplits(t *testing.T) {
 	}
 
 	// Generate an explicit split event.
-	kvDB := s.DB()
 	if err := kvDB.AdminSplit("splitkey"); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +117,7 @@ func TestLogSplits(t *testing.T) {
 	// StoreID 1 is present on the testserver. If this assumption changes in the
 	// future, *any* store will work, but a new method will need to be added to
 	// Stores (or a creative usage of VisitStores could suffice).
-	store, pErr := s.Stores().GetStore(roachpb.StoreID(1))
+	store, pErr := s.(*server.TestServer).Stores().GetStore(roachpb.StoreID(1))
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -139,12 +133,11 @@ func TestLogSplits(t *testing.T) {
 
 func TestLogRebalances(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	// Use a client to get the RangeDescriptor for the first range. We will use
 	// this range's information to log fake rebalance events.
-	db := s.DB()
 	desc := &roachpb.RangeDescriptor{}
 	if err := db.GetProto(keys.RangeDescriptorKey(roachpb.RKeyMin), desc); err != nil {
 		t.Fatal(err)
@@ -154,14 +147,14 @@ func TestLogRebalances(t *testing.T) {
 	// StoreID 1 is present on the testserver. If this assumption changes in the
 	// future, *any* store will work, but a new method will need to be added to
 	// Stores (or a creative usage of VisitStores could suffice).
-	store, err := s.Stores().GetStore(roachpb.StoreID(1))
+	store, err := s.(*server.TestServer).Stores().GetStore(roachpb.StoreID(1))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Log several fake events using the store.
 	logEvent := func(changeType roachpb.ReplicaChangeType) {
-		if err := db.Txn(func(txn *client.Txn) error {
+		if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
 			return store.LogReplicaChangeTest(txn, changeType, desc.Replicas[0], *desc)
 		}); err != nil {
 			t.Fatal(err)
