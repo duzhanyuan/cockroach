@@ -1,9 +1,9 @@
 - Feature Name: Distributing SQL queries
-- Status: draft
+- Status: in-progress
 - Start Date: 2015/02/12
 - Authors: andreimatei, knz, RaduBerinde
-- RFC PR: (PR # after acceptance of initial draft)
-- Cockroach Issue: (one or more # from the issue tracker)
+- RFC PR: [#6067](https://github.com/cockroachdb/cockroach/pull/6067)
+- Cockroach Issue:
 
 # Table of Contents
 
@@ -142,7 +142,7 @@ distribute the processing on multiple nodes (parallelization for performance).
   3. Distributed sorting
 
     When ordering results, we want to be able to distribute the sorting effort.
-    Nodes would sort their own data sets and one ore more nodes would merge the
+    Nodes would sort their own data sets and one or more nodes would merge the
     results.
 
 # Detailed design
@@ -164,8 +164,9 @@ model than MapReduce.
 
 1. A predefined set of *aggregators*, performing functionality required by SQL.
    Most aggregators are configurable, but not fully programmable.
-2. One special aggregator is programmable using a very simple language, but
-   the program is restricted to operating on one row of data at a time.
+2. One special aggregator, the 'evaluator', is programmable using a very simple
+   language, but is restricted to operating on one row of data at
+   a time.
 3. A routing of the results of an aggregator to the next aggregator in the
    query pipeline.
 4. A logical model that allows for SQL to be compiled in a data-location-agnostic
@@ -239,11 +240,11 @@ aggregators was considered; that approach makes it much harder to support outer
 joins, where the `ON` expression evaluation must be part of the internal join
 logic and not just a filter on the output.)
 
-A special type of aggregator is the **program** aggregator which is a
+A special type of aggregator is the **evaluator** aggregator which is a
 "programmable" aggregator which processes the input stream sequentially (one
 element at a time), potentially emitting output elements. This is an aggregator
 with no grouping (group key is the full set of columns); the processing of each
-row independent. A program can be used, for example, to generate new values from
+row independent. An evaluator can be used, for example, to generate new values from
 arbitrary expressions (like the `a+b` in `SELECT a+b FROM ..`); or to filter
 rows according to a predicate.
 
@@ -303,7 +304,7 @@ AGGREGATOR summer
   Group Key: Cid
   Ordering characterization: if input ordered by Cid, output ordered by Cid
 
-PROGRAM sortval
+EVALUATOR sortval
   Input schema: Cid:INT, ValueSum:DECIMAL
   Output schema: SortVal:DECIMAL, Cid:INT, ValueSum:DECIMAL
   Ordering characterization:
@@ -398,7 +399,7 @@ case 1 above, regardless of the ordering of `src`.
 
 ### Back propagation of ordering requirements
 
-In the previous example we saw how we we could use an ordering on a table reader
+In the previous example we saw how we could use an ordering on a table reader
 stream along with an order preservation guarantee to avoid sorting. The
 preliminary logical plan will try to preserve ordering as much as possible to
 minimize any additional sorting.
@@ -458,8 +459,8 @@ Composition: src -> countdistinctmin -> final
   with spans of a table or index and the schema that it needs to read.
   Like every other aggregator, it can be configured with a programmable output
   filter.
-- `PROGRAM` is a fully programmable no-grouping aggregator. It runs a "program"
-  on each individual row. The program can drop the row, or modify it
+- `EVALUATOR` is a fully programmable no-grouping aggregator. It runs a "program"
+  on each individual row. The evaluator can drop the row, or modify it
   arbitrarily.
 - `JOIN` performs a join on two streams, with equality constraints between
   certain columns. The aggregator is grouped on the columns that are
@@ -482,7 +483,7 @@ Composition: src -> countdistinctmin -> final
 
   `AGGREGATOR`'s output schema consists of the group key, plus a configurable
   subset of the generated aggregated values. The optional output filter has
-  access to the group key and all the aggregagated values (i.e. it can use even
+  access to the group key and all the aggregated values (i.e. it can use even
   values that are not ultimately outputted).
 - `SORT` sorts the input according to a configurable set of columns. Note that
   this is a no-grouping aggregator, hence it can be distributed arbitrarily to
@@ -541,7 +542,7 @@ We can distribute using a few simple rules:
  - sorting aggregators apply to each physical stream corresponding to the
    logical stream it is sorting. A sort aggregator by itself will *not* result
    in coalescing results into a single node. This is implicit from the fact that
-   (like programs) it requires no grouping.
+   (like evaluators) it requires no grouping.
 
 It is important to note that correctly distributing the work along range
 boundaries is not necessary for correctness - if a range gets split or moved
@@ -568,7 +569,7 @@ AGGREGATOR summer
   Group Key: Cid
   Ordering characterization: if input ordered by Cid, output ordered by Cid
 
-PROGRAM sortval
+EVALUATOR sortval
   Input schema: Cid:INT, ValueSum:DECIMAL
   Output schema: SortVal:DECIMAL, Cid:INT, ValueSum:DECIMAL
   Ordering characterization: if input ordered by [Cid,]ValueSum[,Cid], output ordered by [Cid,]-ValueSum[,Cid]
@@ -578,11 +579,11 @@ PROGRAM sortval
   }
 ```
 
-![Logical plan](distributed_sql_logical_plan.png?raw=true "Logical Plan")
+![Logical plan](images/distributed_sql_logical_plan.png?raw=true "Logical Plan")
 
 This logical plan above could be instantiated as the following physical plan:
 
-![Physical plan](distributed_sql_physical_plan.png?raw=true "Physical Plan")
+![Physical plan](images/distributed_sql_physical_plan.png?raw=true "Physical Plan")
 
 Each box in the physical plan is a *processor*:
  - `src` is a table reader and performs KV Get operations and forms rows; it is
@@ -604,7 +605,7 @@ Note that the second stage of the `summer` aggregator doesn't need to run on the
 same nodes; for example, an alternate physical plan could use a single stage 2
 processor:
 
-![Alternate physical plan](distributed_sql_physical_plan_2.png?raw=true "Alternate physical Plan")
+![Alternate physical plan](images/distributed_sql_physical_plan_2.png?raw=true "Alternate physical Plan")
 
 The processors always form a directed acyclic graph.
 
@@ -612,7 +613,7 @@ The processors always form a directed acyclic graph.
 
 Processors are generally made up of three components:
 
-![Processor](distributed_sql_processor.png?raw=true "Processor")
+![Processor](images/distributed_sql_processor.png?raw=true "Processor")
 
 1. The *input synchronizer* merges the input streams into a single stream of
    data. Types:
@@ -620,7 +621,7 @@ Processors are generally made up of three components:
    * unsynchronized: passes rows from all input streams, arbitrarily
      interleaved.
    * ordered: the input physical streams have an ordering guarantee (namely the
-     guarantee of the corresponding locical stream); the synchronizer is careful
+     guarantee of the corresponding logical stream); the synchronizer is careful
      to interleave the streams so that the merged stream has the same guarantee.
 
 2. The *data processor* core implements the data transformation or aggregation
@@ -767,7 +768,7 @@ AGGREGATOR final
   Input schema: First:STRING, Last:STRING, Age:INT, College:STRING
 ```
 
-![Logical plan for join](distributed_sql_join_logical.png?raw=true "Logical plan for join")
+![Logical plan for join](images/distributed_sql_join_logical.png?raw=true "Logical plan for join")
 
 At the heart of the physical implementation of the stream join aggregators sits
 the join processor which (in general) puts all the rows from one stream in a
@@ -784,7 +785,7 @@ routers:
    in a group reach the same instance, achieving a hash-join. An example
    physical plan:
 
-   ![Physical plan for hash join](distributed_sql_join_physical.png?raw=true "Physical plan for hash join")
+   ![Physical plan for hash join](images/distributed_sql_join_physical.png?raw=true "Physical plan for hash join")
 
  - the routers can *duplicate* all rows from the physical streams for one table
    and distribute copies to all processor instances; the streams for the other
@@ -795,7 +796,7 @@ routers:
    For the query above, if we expect few results from `src2`, this plan would
    be more efficient:
 
-   ![Physical plan for dup join](distributed_sql_join_physical2.png?raw=true "Physical plan for dup join")
+   ![Physical plan for dup join](images/distributed_sql_join_physical2.png?raw=true "Physical plan for dup join")
 
    The difference in this case is that the streams for the first table stay on
    the same node, and the routers after the `src2` table readers are configured
@@ -941,7 +942,7 @@ tagging to the different streams entering the mailbox, so that the inter-stream
 ordering property can still be used by the consumer.
 
 A diagram of a simple query using mailboxes for its execution:
-![Mailboxes](distributed_sql_mailboxes.png?raw=true)
+![Mailboxes](images/distributed_sql_mailboxes.png?raw=true)
 
 ### On-the-fly flows setup
 
@@ -1098,7 +1099,7 @@ order-by-date -> orders -> count-and-sum -> customers -> inserter -> intent-coll
 ```
 
 A possible physical plan:
-![Physical plan](distributed_sql_daily_promotion_physical_plan.png?raw=true)
+![Physical plan](images/distributed_sql_daily_promotion_physical_plan.png?raw=true)
 
 # Implementation strategy
 

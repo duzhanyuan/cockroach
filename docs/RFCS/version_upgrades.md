@@ -2,7 +2,7 @@
 - Status: rejected
 - Start Date: 2016-04-10
 - Authors: Tobias Schottdorf
-- RFC PR: #5985
+- RFC PR: [#5985](https://github.com/cockroachdb/cockroach/pull/5985)
 - Cockroach Issue:
 
 # Rejection notes
@@ -83,7 +83,7 @@ downgrading is more involved (there's no clear path except through a data dump
 and starting from scratch with the old version). They also have it easier than
 us.
 
-http://docs.datastax.com/en/latest-upgrade/upgrade/cassandra/upgradeChangesC_c.html
+http://docs.datastax.com/en/archived/cassandra/1.2/cassandra/upgrade/upgradeChangesC_c.html
 
 # High level design
 

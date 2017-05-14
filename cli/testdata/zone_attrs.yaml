@@ -1,2 +1,0 @@
-replicas:
-  - attrs: [us-east-1a,ssd]

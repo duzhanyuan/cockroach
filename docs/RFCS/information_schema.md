@@ -2,8 +2,9 @@
 - Status: in-progress
 - Start Date: 2016-07-19
 - Authors: Nathan VanBenschoten
-- RFC PR: #7965
-- Cockroach Issue: #5194, #5583
+- RFC PR: [#7965](https://github.com/cockroachdb/cockroach/pull/7965)
+- Cockroach Issue: [#5194](https://github.com/cockroachdb/cockroach/issues/5194),
+                   [#5583](https://github.com/cockroachdb/cockroach/issues/5583)
 
 
 # Summary
@@ -115,7 +116,7 @@ detailed discussion on `pg_catalog` until the implementation of `information_sch
 
 ### Standards Considerations
 
-It is advised that we take a similar approach to MySQL in it's representation of
+It is advised that we take a similar approach to MySQL in its representation of
 `information_schema`. The `information_schema` table structure will follow the ANSI/ISO
 SQL:2003 standard Part 11 Schemata. The intent is approximate compliance with SQL:2003 core
 feature F021 Basic information schema.
